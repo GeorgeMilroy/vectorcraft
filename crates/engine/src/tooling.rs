@@ -5,9 +5,13 @@ use vectorcraft_doc::Selection;
 use vectorcraft_geom::Point;
 use vectorcraft_tools::distort::perspective::widget::WidgetPlace;
 use vectorcraft_tools::draw2::FEEDBACK;
+use vectorcraft_tools::shape::MAX_CORNER_RADIUS;
 use vectorcraft_tools::{Action, Cursor, ImeSurrounding, Mods, Overlay, PointerEvent, PointerKind, Tool, ToolContext, ToolKey, settings};
 
 use crate::{EngineError, Prefs, Result, Session};
+
+/// The tool whose radius is General › Corner Radius.
+const ROUNDED_RECTANGLE: &str = "roundedRectangle";
 
 /// View state the tools need from the frontend.
 #[derive(Clone, Copy, Debug)]
@@ -23,7 +27,8 @@ pub struct ViewInfo {
     pub snap_to_pixel: bool,
     /// View → Snap to Point: picked points (a transform's reference point) land on anchors.
     pub snap_to_point: bool,
-    /// View → Snap to Glyph: drawing snaps to live-text baselines and glyph bounds (needs Smart Guides).
+    /// View → Snap to Glyph: drawing snaps to live-text glyph bounds, and on a single line of type to
+    /// its baseline, x-height, character widths and glyph anchor points (needs Smart Guides).
     pub snap_to_glyph: bool,
     /// View → Show Corner Widget.
     pub corner_widgets: bool,
@@ -177,7 +182,7 @@ impl Session {
         let r = self.apply_actions(acts);
         self.keep_tool_settings();
         self.tool = lender;
-        self.after_command();
+        self.after_command(None);
         r.map(drop)
     }
 
@@ -186,6 +191,10 @@ impl Session {
     pub(crate) fn make_tool(&self, id: &str) -> Box<dyn Tool> {
         let mut t = vectorcraft_tools::create(id);
         Self::restore_tool_settings(&self.prefs, t.as_mut());
+        // General › Corner Radius is the Rounded Rectangle tool's radius (#394).
+        if id == ROUNDED_RECTANGLE {
+            t.set_option("cornerRadius", &Value::from(self.prefs.corner_radius));
+        }
         t
     }
 
@@ -204,6 +213,14 @@ impl Session {
     /// Store the persistent options of `t` in `prefs` (so they are saved with them too).
     fn store_tool_settings(prefs: &mut Prefs, t: &dyn Tool) {
         let opts = t.options();
+        // The radius ↑ and ↓ set while drawing a rounded rectangle (or `tool.setOption`) is the
+        // Corner Radius preference from then on, as in the reference app
+        // (<https://helpx.adobe.com/illustrator/using/drawing-simple-lines-shapes.html>).
+        if t.id() == ROUNDED_RECTANGLE
+            && let Some(r) = opts.get("cornerRadius").and_then(Value::as_f64).filter(|r| r.is_finite())
+        {
+            prefs.corner_radius = r.clamp(0.0, MAX_CORNER_RADIUS);
+        }
         for (store, keys) in settings::stores(t.id()) {
             let saved = prefs.tool_settings.entry(store.to_string()).or_default();
             for k in keys {
@@ -399,6 +416,12 @@ impl Session {
         self.tool.wants_ticks()
     }
 
+    /// Does the active tool build a stroke from every position the pointer passed
+    /// ([`vectorcraft_tools::Tool::wants_samples`])?
+    pub fn tool_wants_samples(&self) -> bool {
+        self.tool.wants_samples()
+    }
+
     /// Is the active tool waiting for work it runs on another thread ([`Tool::waiting`])?
     pub fn tool_waiting(&self) -> bool {
         self.tool.waiting()
@@ -443,6 +466,7 @@ impl Session {
         self.with_tool_cx(view, |t, cx| t.ime_session_matches_document(cx))
     }
 
+    /// Whether the active tool currently owns keyboard text input, as the Type tool does while editing.
     pub fn tool_wants_text(&self) -> bool {
         self.tool.wants_text()
     }
@@ -601,7 +625,19 @@ impl Session {
         }
         Self::store_tool_settings(&mut self.prefs, t);
         let out = t.options();
-        if other.is_some() {
+        if let Some(other) = other {
+            // The tool that lent a selection tool for a Cmd-drag is kept aside, not made again when
+            // it is back: when it is the tool set, it takes the writes too (the Rounded Rectangle's
+            // radius stays the Corner Radius preference it just set) and what it shares, like the
+            // active tool.
+            if let Some(lender) = self.lender.as_deref_mut() {
+                if lender.id() == other.id() {
+                    for (k, v) in values {
+                        lender.set_option(k, v);
+                    }
+                }
+                Self::restore_tool_settings(&self.prefs, lender);
+            }
             Self::restore_tool_settings(&self.prefs, self.tool.as_mut());
         }
         out
@@ -643,15 +679,31 @@ impl Session {
 
     /// Let the active tool finish work a command from outside it ended ([`vectorcraft_tools::Tool::after_command`]):
     /// the Type tool and the Eyedropper clear a character range whose text is no longer selected.
-    pub(crate) fn after_command(&mut self) {
+    /// After `edit.undo` or `edit.redo` (`cmd`), the tool is told first, so the Type tool puts the
+    /// caret where the step changed the text.
+    pub(crate) fn after_command(&mut self, cmd: Option<&str>) {
         if self.in_tool_actions || (!self.tool.wants_text() && self.tool.id() != "eyedropper") {
             return;
+        }
+        if let Some(cmd @ ("edit.undo" | "edit.redo")) = cmd {
+            self.notify_text_tool(cmd);
         }
         let acts = self.with_tool_cx(self.last_view, |t, cx| t.after_command(cx));
         // The command itself succeeded: a failure here only leaves the edit as it was.
         if let Err(e) = self.apply_actions(acts) {
             log::warn!("ending the text edit: {e}");
         }
+    }
+
+    /// Tell the active tool that `edit.undo` or `edit.redo` ran, on its own or as a step of
+    /// `command.batch`, so the Type tool puts the caret where the step changed the text; or that a
+    /// `command.batch` began, ended or was rolled back (`batch.begin`, `batch.end`,
+    /// `batch.rollBack`), so the Type tool puts back what its Undo and Redo steps changed when it fails.
+    pub(crate) fn notify_text_tool(&mut self, what: &str) {
+        if self.in_tool_actions || (!self.tool.wants_text() && self.tool.id() != "eyedropper") {
+            return;
+        }
+        self.with_tool_cx(self.last_view, |t, cx| t.notify(cx, what));
     }
 
     /// Apply tool actions. Errors from previews are reported but keep the interaction alive.

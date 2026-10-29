@@ -8,6 +8,42 @@ use vectorcraft_geom::{Affine, FillRule, PathData, Point, Rect, shapes};
 
 use crate::*;
 
+mod blend;
+mod charstroke;
+mod cmykblend;
+mod cmykimages;
+mod compression;
+mod dashalign;
+mod editing;
+mod encrypt;
+mod file_info;
+mod focal;
+mod fx;
+mod import_color;
+pub(super) mod import_fidelity;
+mod import_layers;
+mod import_lines;
+mod import_options;
+mod import_overprint;
+mod layers;
+pub(super) mod live_text;
+mod marks;
+mod output;
+mod pdf13;
+mod pdfx;
+mod presets;
+mod print;
+mod printadvanced;
+mod reader_compat;
+mod reader_streaming;
+mod realtext;
+mod settings;
+pub(super) mod stroke;
+mod strokeout;
+mod text_placement;
+mod textstroke;
+mod webview;
+
 fn doc(w: f64, h: f64) -> Document {
     Document::new(w, h)
 }
@@ -37,13 +73,18 @@ fn close(a: Rect, b: Rect, tol: f64) -> bool {
     (a.x0 - b.x0).abs() < tol && (a.y0 - b.y0).abs() < tol && (a.x1 - b.x1).abs() < tol && (a.y1 - b.y1).abs() < tol
 }
 
+/// `d` exported with the default options and imported back: the document a round trip through a PDF
+/// gives.
 fn roundtrip(d: &Document) -> Document {
     let bytes = export(d, &PdfOptions::default()).expect("export");
     import(&bytes).expect("import")
 }
 
+/// `d` exported uncompressed, dated `created: Some(0)` rather than by the clock: two exports of one
+/// document are then the same bytes, where the clock's dates, in whole seconds, differ whenever a
+/// second ticks between them.
 fn uncompressed(d: &Document) -> String {
-    let bytes = export(d, &PdfOptions::uncompressed()).expect("export");
+    let bytes = export(d, &PdfOptions { created: Some(0), ..PdfOptions::uncompressed() }).expect("export");
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -574,6 +615,31 @@ fn image_roundtrip() {
     let decoded = image::load_from_memory(&blob.bytes).unwrap().to_rgba8();
     assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
     assert_eq!(decoded.get_pixel(3, 0).0, [0, 0, 0, 255]);
+}
+
+/// Images are written with /Interpolate true, so viewers may smooth them; a pixelated image (an
+/// envelope's with Anti-Alias off) is written without it.
+#[test]
+fn a_pixelated_image_asks_viewers_not_to_smooth_it() {
+    for pixelated in [false, true] {
+        let mut d = doc(200.0, 200.0);
+        d.images.insert("img1".into(), ImageBlob::new("image/png", tiny_png()));
+        let im = ImageObject {
+            key: "img1".into(),
+            width: 4,
+            height: 2,
+            xf: Affine::translate((20.0, 30.0)) * Affine::scale(10.0),
+            link: None,
+            placement: Default::default(),
+            pixels: None,
+        };
+        let mut n = Node::new(NodeId(0), NodeKind::Image(Box::new(im)));
+        n.extras_mut().pixelated = pixelated;
+        add(&mut d, n);
+        let pdf = uncompressed(&d);
+        assert_eq!(pdf.matches("/Width 4").count(), 1, "the image is written");
+        assert_eq!(pdf.matches("/Interpolate").count(), usize::from(!pixelated), "pixelated: {pixelated}");
+    }
 }
 
 /// A 4 × 2 red image encoded as `format`, cut short `keep` bytes past the first `tag` in it: its
