@@ -109,7 +109,7 @@ fn screen_readers_name_the_tool_buttons_and_the_active_tool() {
     let name = |id| tool_info(id).map(tip).unwrap_or_default();
     assert_eq!(role_and_state(&tree, &name("pen")), (Role::Button, Some(Toggled::True)));
     assert_eq!(role_and_state(&tree, &name("selection")), (Role::Button, Some(Toggled::False)));
-    for label in ["Toggle single/double column", "Drag to float the toolbar", "Color (,)", "Gradient (.)", "None (/)"] {
+    for label in ["Toggle single/double column", "Drag to float the toolbar", "Color (, or <)", "Gradient (. or >)", "None (/)"] {
         assert_eq!(role_and_state(&tree, label), (Role::Button, None), "{label}");
     }
 }
@@ -175,6 +175,34 @@ fn double_clicking_a_tool_button_opens_its_options() {
     let o = app.session.prefs.eyedropper;
     assert!(o.pick_up.appearance.transparency && !o.apply.appearance.transparency && o.apply.appearance.fill.color);
     assert!(app.run("tool.options", json!({"tool": "lasso"})).is_err());
+}
+
+/// A click on the Blend tool's button while the Blend tool holds a first pick finishes the
+/// blend: the tool stays chosen, and the next click on the canvas picks a new first object
+/// instead of blending with the first.
+#[test]
+fn clicking_the_active_blend_tool_button_finishes_the_blend() {
+    let mut app = VectorcraftApp::new(Session::new(), Default::default());
+    app.ui.toolbar_advanced = true;
+    app.run("file.new", json!({"width": 600, "height": 300})).unwrap();
+    for x in [0, 200] {
+        app.run("shape.rectangle", json!({"x": x, "y": 0, "width": 40, "height": 40})).unwrap();
+    }
+    app.select_tool("blend");
+    let index = slots(&app).iter().position(|(_, tools)| tools.contains(&"blend")).expect("a toolbar slot");
+    let ctx = egui::Context::default();
+    let at = frame_in(&mut app, &ctx, 0.0, vec![], 2000.0)[index].center();
+    let down = |x, y| vectorcraft_tools::PointerEvent::new(vectorcraft_tools::PointerKind::Down, x, y);
+    let view = app.view_info();
+    app.session.pointer(&down(20.0, 20.0), view).unwrap();
+    assert!(app.session.tool_busy(), "the first rectangle is picked");
+    let layers = app.session.active().unwrap().doc.layers.clone();
+    click_in(&mut app, &ctx, 1.0, at, PointerButton::Primary, 2000.0);
+    assert_eq!(app.session.tool_id(), "blend");
+    assert!(!app.session.tool_busy(), "the click on the button drops the pick");
+    app.session.pointer(&down(220.0, 20.0), view).unwrap();
+    assert!(app.session.tool_busy(), "the second rectangle is a new first pick");
+    assert_eq!(app.session.active().unwrap().doc.layers, layers, "no blend was made");
 }
 
 /// A double-click on the Type on a Path or Vertical Type on a Path tool opens Type on a Path

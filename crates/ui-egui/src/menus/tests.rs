@@ -283,6 +283,20 @@ fn panel_ids_are_case_insensitive_and_labels_work() {
     app.ui.dock_collapsed = false;
 }
 
+/// #4542: Edit › Color Settings… and Assign Profile… show the Separations Preview panel, which
+/// isn't in an icon column, and leave it showing when it already does.
+#[test]
+fn color_settings_and_assign_profile_show_the_separations_panel() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), crate::Services::default());
+    app.run("file.new", json!({})).unwrap();
+    let shown = |app: &VectorcraftApp| checked(app, "window.panel", &json!({"panel": "separations"})).unwrap();
+    assert!(!shown(&app));
+    for id in ["edit.colorSettings", "edit.colorSettings", "edit.assignProfile"] {
+        app.run(id, json!({})).unwrap();
+        assert!(shown(&app), "{id} shows the panel");
+    }
+}
+
 #[test]
 fn saved_views_store_and_restore_the_view() {
     let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), crate::Services::default());
@@ -663,7 +677,11 @@ fn lock_and_hide_menus_are_greyed_out_in_isolation_mode() {
     app.run("file.new", json!({})).unwrap();
     let a = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap()["id"].clone();
     let b = app.run("shape.rectangle", json!({"x": 80, "y": 10, "width": 50, "height": 50})).unwrap()["id"].clone();
+    app.run("select.none", json!({})).unwrap();
+    let lock_unselected = |app: &VectorcraftApp| crate::menus::enabled(app, "object.lock.unselected");
+    assert!(!lock_unselected(&app), "nothing selected");
     app.run("select.set", json!({"ids": [a, b.clone()]})).unwrap();
+    assert!(lock_unselected(&app), "selection present");
     let g = app.run("object.group", json!({})).unwrap()["id"].clone();
     let lock_and_hide: Vec<String> = menu_entries(&app)
         .into_iter()
@@ -698,6 +716,7 @@ fn lock_and_hide_menus_are_greyed_out_in_isolation_mode() {
     app.run("object.isolate", json!({"id": g.clone()})).unwrap();
     app.run("select.set", json!({"ids": [b]})).unwrap();
     assert_eq!(shown(&app), [false, false, false, false, false, false, false, false, false, true], "in isolation mode");
+    assert!(lock_unselected(&app), "shortcut command remains enabled in isolation");
     app.run("object.exitIsolation", json!({})).unwrap();
     app.run("select.set", json!({"ids": [g]})).unwrap();
     assert_eq!(shown(&app), [true; 10], "after Exit Isolation Mode");

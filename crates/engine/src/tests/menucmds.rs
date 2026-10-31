@@ -38,8 +38,8 @@ fn sel(s: &mut Session, ids: &[NodeId]) {
     s.execute("select.set", &json!({"ids": ids.iter().map(|i| i.0).collect::<Vec<_>>()})).unwrap();
 }
 
-/// A placed 64 × 32 px PNG whose header reads (so it places at its size) but whose pixel data is
-/// cut short: the renderer can't decode it and draws nothing.
+/// A placed 64 × 32 px PNG whose header reads but whose pixel data is cut short
+/// ([`cut_pixels`]): the renderer can't decode it and draws nothing.
 pub(crate) fn place_undecodable_png(s: &mut Session) -> NodeId {
     place_undecodable_png_sized(s, 64, 32)
 }
@@ -51,10 +51,34 @@ pub(crate) fn place_undecodable_png_sized(s: &mut Session, w: u32, h: u32) -> No
     image::RgbaImage::from_pixel(w, h, image::Rgba([200, 30, 30, 255]))
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
+    let r = s.execute("file.place", &json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&png)})).unwrap();
+    let id = NodeId(r["ids"][0].as_u64().unwrap());
+    cut_pixels(s, id);
+    id
+}
+
+/// Cut the pixel data of the PNG that placed image `id` shows short, right after its first `IDAT`
+/// chunk's type, as a document saved with a damaged image holds it: the header still reads, but
+/// the renderer can't decode the image. Place refuses such a file, so tests cut a placed one. The
+/// image is stored under the key of its new bytes.
+pub(crate) fn cut_pixels(s: &mut Session, id: NodeId) {
+    let doc = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc);
+    let Some(NodeKind::Image(im)) = doc.node(id).map(|n| &n.kind) else { panic!("{id:?} is not an image") };
+    let old = im.key.clone();
+    let mut png = doc.images[&old].bytes.to_vec();
     let idat = png.windows(4).position(|w| w == b"IDAT").unwrap();
     png.truncate(idat + 8);
-    let r = s.execute("file.place", &json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&png)})).unwrap();
-    NodeId(r["ids"][0].as_u64().unwrap())
+    let cut = vectorcraft_doc::ImageBlob::new("image/png", png);
+    let key = cut.content_key();
+    doc.images.insert(key.clone(), cut);
+    if let Some(Node { kind: NodeKind::Image(im), .. }) = doc.node_mut(id) {
+        im.key = key;
+    }
+    let mut shown = false;
+    doc.visit_images(|_, im| shown |= im.key == old);
+    if !shown {
+        doc.images.remove(&old);
+    }
 }
 
 /// Whether reply `r` warns that an image couldn't be decoded, as raster exports do.
@@ -494,8 +518,9 @@ fn lock_and_hide_with_nothing_to_lock_or_hide_record_no_undo_step() {
 
 /// Hide › Unselected Artwork hides, in one undo step, each object that is not selected and holds no selected object:
 /// here `b`, the member `n` of the group that holds the selected `m`, and `p` on another layer. The selected objects,
-/// that group, the clip group that holds the selected `c2` with all its members, a locked object, the art on a locked
-/// layer and an object hidden before stay as they are, and so does the selection. Show All shows them again.
+/// that group, the clip group that holds the selected `c2` with all its members, the compound path that holds the
+/// selected `hole` with both paths, a guide under Lock Guides, a locked object, the art on a locked layer and an
+/// object hidden before stay as they are, and so does the selection. Show All shows them again.
 #[test]
 fn hide_unselected_artwork_hides_every_object_that_is_not_selected() {
     let mut s = session();
@@ -510,6 +535,14 @@ fn hide_unselected_artwork_hides_every_object_that_is_not_selected() {
     let c3 = rect(&mut s, 80.0, 0.0, 30.0, 30.0);
     sel(&mut s, &[c1, c2, c3]);
     let clip = id_of(&s.execute("object.clippingMask.make", &json!({})).unwrap());
+    let outer = rect(&mut s, 0.0, 200.0, 100.0, 100.0);
+    let hole = rect(&mut s, 40.0, 240.0, 20.0, 20.0);
+    sel(&mut s, &[outer, hole]);
+    let compound = id_of(&s.execute("object.compoundPath.make", &json!({})).unwrap());
+    let guide = rect(&mut s, 200.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[guide]);
+    s.execute("view.guides.make", &json!({})).unwrap();
+    s.execute("view.guides.lock", &json!({"locked": true})).unwrap();
     let k = rect(&mut s, 120.0, 0.0, 10.0, 10.0);
     s.execute("layer.setProps", &json!({"id": k.0, "locked": true})).unwrap();
     let h = rect(&mut s, 140.0, 0.0, 10.0, 10.0);
@@ -520,13 +553,13 @@ fn hide_unselected_artwork_hides_every_object_that_is_not_selected() {
     let q = rect(&mut s, 20.0, 100.0, 10.0, 10.0);
     s.execute("layer.setProps", &json!({"id": locked_layer.0, "locked": true})).unwrap();
     let shown = |s: &Session, ids: &[NodeId]| ids.iter().map(|id| node(s, *id).visible).collect::<Vec<_>>();
-    sel(&mut s, &[a, m, c2]);
+    sel(&mut s, &[a, m, c2, hole]);
     let steps = undo_len(&s);
     assert_eq!(s.execute("object.hide.unselected", &json!({})).unwrap(), json!({"count": 3}));
     assert_eq!(shown(&s, &[b, n, p, h]), [false; 4]);
-    assert_eq!(shown(&s, &[a, m, g, c1, c2, c3, clip, k, q]), [true; 9]);
+    assert_eq!(shown(&s, &[a, m, g, c1, c2, c3, clip, compound, outer, hole, guide, k, q]), [true; 13]);
     assert!(node(&s, k).locked);
-    assert_eq!((undo_len(&s), selected(&s)), (steps + 1, vec![a, m, c2]));
+    assert_eq!((undo_len(&s), selected(&s)), (steps + 1, vec![a, m, c2, hole]));
     s.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(shown(&s, &[b, n, p]), [true; 3]);
     s.execute("edit.redo", &json!({})).unwrap();
@@ -596,6 +629,179 @@ fn hide_unselected_artwork_keeps_locked_guides_and_is_disabled_in_isolation_mode
     sel(&mut s, &[hole]);
     assert_eq!(hide(&mut s), json!({"count": 1}));
     assert_eq!(shown(&s, &[g, c, outer, hole]), [false, true, true, true]);
+}
+
+/// While Lock Guides is on, Hide › Unselected Artwork keeps a group that holds a guide path visible and hides its other
+/// members one by one. With a layer selected, the objects on that layer stay visible and the rest are hidden.
+#[test]
+fn hide_unselected_artwork_keeps_groups_with_locked_guides_and_the_selected_layers_art() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+    let b = rect(&mut s, 20.0, 0.0, 10.0, 10.0);
+    let guide = rect(&mut s, 40.0, 0.0, 10.0, 10.0);
+    let x = rect(&mut s, 60.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[guide, x]);
+    let g = id_of(&s.execute("object.group", &json!({})).unwrap());
+    sel(&mut s, &[guide]);
+    s.execute("view.guides.make", &json!({})).unwrap();
+    s.execute("view.guides.lock", &json!({"locked": true})).unwrap();
+    let other = id_of(&s.execute("layer.new", &json!({})).unwrap());
+    let p = rect(&mut s, 0.0, 100.0, 10.0, 10.0);
+    let hide = |s: &mut Session| s.execute("object.hide.unselected", &json!({})).unwrap();
+    let shown = |s: &Session, ids: &[NodeId]| ids.iter().map(|id| node(s, *id).visible).collect::<Vec<_>>();
+    sel(&mut s, &[a]);
+    assert_eq!(hide(&mut s), json!({"count": 3}));
+    assert_eq!(shown(&s, &[a, b, g, guide, x, p]), [true, false, true, true, false, false]);
+    s.execute("object.showAll", &json!({})).unwrap();
+    sel(&mut s, &[other]);
+    assert_eq!(hide(&mut s), json!({"count": 3}));
+    assert_eq!(shown(&s, &[a, b, g, guide, x, p]), [false, false, true, true, false, true]);
+    assert_eq!(selected(&s), [other]);
+}
+
+/// Lock Unselected Artwork locks `b`, `n` in the group that holds selected `m`, `p` on another layer, and the clip
+/// group's unselected members `c1` and clipping path `c3` in one undo step labeled "Lock". The clip group container,
+/// `c2`, the selected objects, group `g`, hidden object `h` and art `q` on a locked layer stay unlocked. `k` was locked
+/// before. The selection stays as it is. Unlock All unlocks all six locked objects and selects them.
+#[test]
+fn lock_unselected_artwork_locks_every_object_that_is_not_selected() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+    let b = rect(&mut s, 20.0, 0.0, 10.0, 10.0);
+    let m = rect(&mut s, 40.0, 0.0, 10.0, 10.0);
+    let n = rect(&mut s, 60.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[m, n]);
+    let g = id_of(&s.execute("object.group", &json!({})).unwrap());
+    let c1 = rect(&mut s, 80.0, 0.0, 10.0, 10.0);
+    let c2 = rect(&mut s, 85.0, 5.0, 10.0, 10.0);
+    let c3 = rect(&mut s, 80.0, 0.0, 30.0, 30.0);
+    sel(&mut s, &[c1, c2, c3]);
+    let clip = id_of(&s.execute("object.clippingMask.make", &json!({})).unwrap());
+    let k = rect(&mut s, 120.0, 0.0, 10.0, 10.0);
+    s.execute("layer.setProps", &json!({"id": k.0, "locked": true})).unwrap();
+    let h = rect(&mut s, 140.0, 0.0, 10.0, 10.0);
+    s.execute("layer.setProps", &json!({"id": h.0, "visible": false})).unwrap();
+    s.execute("layer.new", &json!({})).unwrap();
+    let p = rect(&mut s, 0.0, 100.0, 10.0, 10.0);
+    let locked_layer = id_of(&s.execute("layer.new", &json!({})).unwrap());
+    let q = rect(&mut s, 20.0, 100.0, 10.0, 10.0);
+    s.execute("layer.setProps", &json!({"id": locked_layer.0, "locked": true})).unwrap();
+    let locked = |s: &Session, ids: &[NodeId]| ids.iter().map(|id| node(s, *id).locked).collect::<Vec<_>>();
+    sel(&mut s, &[a, m, c2]);
+    let steps = undo_len(&s);
+    assert_eq!(s.execute("object.lock.unselected", &json!({})).unwrap(), json!({"count": 5}));
+    assert_eq!(locked(&s, &[b, n, p, c1, c3, k]), [true; 6]);
+    assert_eq!(locked(&s, &[a, m, g, c2, clip, h, q]), [false; 7]);
+    assert_eq!((undo_len(&s), selected(&s)), (steps + 1, vec![a, m, c2]));
+    assert_eq!(s.doc().unwrap().history.undo.last().unwrap().label, "Lock");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(locked(&s, &[b, n, p]), [false; 3]);
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(locked(&s, &[b, n, p]), [true; 3]);
+    assert_eq!(s.execute("object.unlockAll", &json!({})).unwrap(), json!({"count": 6}));
+    assert_eq!(locked(&s, &[b, n, p, c1, c3, k]), [false; 6]);
+    let mut unlocked = selected(&s);
+    unlocked.sort();
+    let mut want = vec![b, n, p, c1, c3, k];
+    want.sort();
+    assert_eq!(unlocked, want);
+}
+
+/// Lock Unselected Artwork affects only the isolated group's other members. Lock Guides does not protect an unselected
+/// guide from this command. With nothing left to lock it records no undo step.
+#[test]
+fn lock_unselected_artwork_scopes_isolation_and_locks_guides() {
+    let mut s = session();
+    let guide = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[guide]);
+    s.execute("view.guides.make", &json!({})).unwrap();
+    s.execute("view.guides.lock", &json!({"locked": true})).unwrap();
+    let out = rect(&mut s, 20.0, 0.0, 10.0, 10.0);
+    let m = rect(&mut s, 40.0, 0.0, 10.0, 10.0);
+    let n = rect(&mut s, 60.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[m, n]);
+    let g = id_of(&s.execute("object.group", &json!({})).unwrap());
+    let lock = |s: &mut Session| s.execute("object.lock.unselected", &json!({})).unwrap();
+    let locked = |s: &Session, ids: &[NodeId]| ids.iter().map(|id| node(s, *id).locked).collect::<Vec<_>>();
+    s.execute("object.isolate", &json!({"id": g.0})).unwrap();
+    select_with_a_step_to_redo(&mut s, &[m]);
+    let info = find_command("object.lock.unselected").unwrap().info(&s);
+    assert!(info.enabled, "{info:?}");
+    let before = undo_len(&s);
+    assert_eq!(lock(&mut s), json!({"count": 1}));
+    assert_eq!(locked(&s, &[m, n, out, guide]), [false, true, false, false]);
+    assert_eq!((undo_len(&s), selected(&s)), (before + 1, vec![m]));
+    s.execute("object.exitIsolation", &json!({})).unwrap();
+    sel(&mut s, &[m]);
+    assert!(find_command("object.lock.unselected").unwrap().info(&s).enabled);
+    assert_eq!(lock(&mut s), json!({"count": 2}));
+    assert_eq!(locked(&s, &[n, out, guide, g, m]), [true, true, true, false, false]);
+    select_with_a_step_to_redo(&mut s, &[m]);
+    let before = history(&s);
+    assert_eq!(lock(&mut s), json!({"count": 0}));
+    assert_eq!(history(&s), before);
+    s.execute("view.guides.lock", &json!({"locked": false})).unwrap();
+}
+
+/// Lock Unselected Artwork locks the unselected path of a partly selected compound path, but needs a selection.
+#[test]
+fn lock_unselected_artwork_descends_into_compound_and_needs_selection() {
+    let mut s = session();
+    let outer = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+    let hole = rect(&mut s, 40.0, 40.0, 20.0, 20.0);
+    sel(&mut s, &[outer, hole]);
+    let compound = id_of(&s.execute("object.compoundPath.make", &json!({})).unwrap());
+    s.execute("select.none", &json!({})).unwrap();
+    let before = history(&s);
+    assert!(!find_command("object.lock.unselected").unwrap().info(&s).enabled);
+    assert!(matches!(s.execute("object.lock.unselected", &json!({})), Err(EngineError::Disabled(..))));
+    assert_eq!(history(&s), before);
+    sel(&mut s, &[hole]);
+    assert_eq!(s.execute("object.lock.unselected", &json!({})).unwrap(), json!({"count": 1}));
+    assert!(node(&s, outer).locked);
+    assert!(!node(&s, hole).locked);
+    assert!(!node(&s, compound).locked);
+    assert_eq!(selected(&s), [hole]);
+}
+
+/// Lock Unselected Artwork leaves all art on a selected layer unlocked and locks unselected art on another layer.
+#[test]
+fn lock_unselected_artwork_keeps_a_selected_layers_art() {
+    let mut s = session();
+    let selected_layer = id_of(&s.execute("layer.new", &json!({})).unwrap());
+    let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+    let b = rect(&mut s, 20.0, 0.0, 10.0, 10.0);
+    s.execute("layer.new", &json!({})).unwrap();
+    let other = rect(&mut s, 40.0, 0.0, 10.0, 10.0);
+    sel(&mut s, &[selected_layer]);
+    assert_eq!(s.execute("object.lock.unselected", &json!({})).unwrap(), json!({"count": 1}));
+    assert_eq!([a, b, other].map(|id| node(&s, id).locked), [false, false, true]);
+    assert_eq!(selected(&s), [selected_layer]);
+}
+
+/// In a plain group, Lock and Hide Unselected Artwork affect the same members of identical documents.
+#[test]
+fn lock_and_hide_unselected_artwork_choose_the_same_objects() {
+    let prepare = || {
+        let mut s = session();
+        let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+        let b = rect(&mut s, 20.0, 0.0, 10.0, 10.0);
+        let m = rect(&mut s, 40.0, 0.0, 10.0, 10.0);
+        let n = rect(&mut s, 60.0, 0.0, 10.0, 10.0);
+        sel(&mut s, &[m, n]);
+        let g = id_of(&s.execute("object.group", &json!({})).unwrap());
+        sel(&mut s, &[a, m]);
+        (s, [a, b, m, n, g])
+    };
+    let (mut locked, lock_ids) = prepare();
+    let (mut hidden, hide_ids) = prepare();
+    assert_eq!(lock_ids, hide_ids);
+    assert_eq!(locked.execute("object.lock.unselected", &json!({})).unwrap(), json!({"count": 2}));
+    assert_eq!(hidden.execute("object.hide.unselected", &json!({})).unwrap(), json!({"count": 2}));
+    let changed_by_lock: Vec<_> = lock_ids.into_iter().filter(|id| node(&locked, *id).locked).collect();
+    let changed_by_hide: Vec<_> = hide_ids.into_iter().filter(|id| !node(&hidden, *id).visible).collect();
+    assert_eq!(changed_by_lock, changed_by_hide);
+    assert_eq!(changed_by_lock, [lock_ids[1], lock_ids[3]]);
 }
 
 // ---------- Transform Each ----------
