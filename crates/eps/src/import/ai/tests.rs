@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kurbo::{Point, Rect};
+use kurbo::{Affine, Point, Rect};
 use vectorcraft_color::gradient::GradientKind;
 use vectorcraft_color::{BlendMode, Color, Paint};
 use vectorcraft_doc::{AppearanceItem, ColorMode, Document, Guide, Knockout, LayerColor, LineCap, LineJoin, Node, NodeKind, Unit};
@@ -52,6 +52,14 @@ fn ruler_units_from_the_header_set_the_documents_units() {
     assert_eq!(read(with_in.as_bytes()).unwrap().doc.units, Unit::Inches);
     let with_px = with_mm.replace("AI5_RulerUnits: 1", "AI5_RulerUnits: 6");
     assert_eq!(read(with_px.as_bytes()).unwrap().doc.units, Unit::Pixels);
+}
+
+#[test]
+fn arrays_nested_past_the_depth_limit_are_refused() {
+    let deep = |n: usize| layer(&format!("{}{} pop", "[".repeat(n), "]".repeat(n)));
+    let nested = |n: usize| read(stream(&deep(n)).as_bytes()).err().is_some_and(|e| e.contains("nested too deeply"));
+    assert!(!nested(200));
+    assert!(nested(100_000));
 }
 
 /// The children of the first layer.
@@ -219,6 +227,163 @@ fn a_note_or_ap_in_a_skipped_section_does_not_reach_the_art_after_it() {
     let n = &art(&doc)[0];
     assert_eq!(note(n), "");
     assert!(!n.shows_center());
+}
+
+/// A node's URL and data (object tags), empty when it has no attributes.
+fn tags(n: &Node) -> (String, Vec<(String, String)>) {
+    n.extras().attrs.as_deref().map(|a| (a.url.clone(), a.data.clone())).unwrap_or_default()
+}
+
+fn tag(id: &str, value: &str) -> (String, String) {
+    (id.to_string(), value.to_string())
+}
+
+/// `/identifier (string) XT` tags the object before it (version 7 specification §7): `AdobeURL`
+/// is its URL, and other tags go to its data in order, an empty string included. Paths, groups,
+/// compound paths, text objects and images take tags.
+#[test]
+fn object_tags_are_kept_on_the_object_before_them() {
+    let [a, b, c, d] = [0.0, 20.0, 40.0, 60.0].map(|x| rect_path(x, 0.0, x + 10.0, 10.0));
+    let text = "0 To\n1 0 0 1 10 50 0 Tp\nTP\n0 Tr\n0 0 0 1 k\n/_Helvetica 12 Tf\n(Hi) Tx\nTO\n";
+    let body = format!(
+        "{a}N\n/part_no (A-12) XT\n/AdobeURL (https://example.com/a) XT\n/part_no (A-13) XT\n\
+         u\n{b}f\nU\n/hand () XT\n*u\n{c}f\n{d}f\n*U\n/shape (two \\(parts\\)) XT\n{text}/AdobeURL (https://example.com/t) XT\n{a}f\n"
+    );
+    let r = read(stream7(&layer7("L", &body)).as_bytes()).unwrap();
+    let got: Vec<_> = art(&r.doc).iter().map(|n| tags(n)).collect();
+    assert_eq!(
+        got,
+        [
+            ("https://example.com/a".to_string(), vec![tag("part_no", "A-12"), tag("part_no", "A-13")]),
+            (String::new(), vec![tag("hand", "")]),
+            (String::new(), vec![tag("shape", "two (parts)")]),
+            ("https://example.com/t".to_string(), vec![]),
+            (String::new(), vec![]),
+        ]
+    );
+    assert!(r.warnings.is_empty() && r.unread.is_empty(), "{:?} {:?}", r.warnings, r.unread);
+    // The group's and the compound path's paths keep no tags of their own.
+    for n in &art(&r.doc)[1..3] {
+        assert!(n.children().unwrap().iter().all(|k| k.extras().attrs.is_none()));
+    }
+    // A later `AdobeURL` replaces an earlier one.
+    let body = format!("{a}f\n/AdobeURL (https://example.com/1) XT\n/AdobeURL (https://example.com/2) XT\n");
+    assert_eq!(tags(&art(&read7(&layer7("L", &body)).doc)[0]).0, "https://example.com/2");
+}
+
+/// A tag with no object right before it (at a layer's start, after a state change, after a group
+/// opens) and a tag with an empty identifier tag nothing; one with operands of another kind is an
+/// operator the reader doesn't know.
+#[test]
+fn object_tags_without_an_object_before_them_tag_nothing() {
+    let a = rect_path(0.0, 0.0, 10.0, 10.0);
+    for body in
+        [format!("/first (x) XT\n{a}f\n"), format!("{a}f\n1 w\n/late (x) XT\n"), format!("u\n/inside (x) XT\n{a}f\nU\n"), format!("{a}f\n/ (x) XT\n")]
+    {
+        let doc = read7(&layer7("L", &body)).doc;
+        let mut all = art(&doc);
+        all.extend(all.iter().flat_map(|n| n.children().cloned().unwrap_or_default()).collect::<Vec<_>>());
+        assert!(all.iter().all(|n| n.extras().attrs.is_none()), "{body}");
+    }
+    for bad in ["(x) (y) XT\n", "/id 3 XT\n", "XT\n"] {
+        let err = read(stream7(&layer7("L", &format!("{a}f\n{bad}"))).as_bytes()).unwrap_err();
+        assert!(err.contains("operators VectorCraft doesn't know"), "{bad}: {err}");
+    }
+    // Outside any layer too.
+    let err = read(stream7(&format!("(x) (y) XT\n{}", layer7("L", &format!("{a}f\n")))).as_bytes()).unwrap_err();
+    assert!(err.contains("operators VectorCraft doesn't know"), "{err}");
+}
+
+/// A clipping path's tags are its own, not those of the copy that paints its fill, and a clip
+/// group's tags after `Q` are the group's. One object keeps at most 64 tags in its data.
+#[test]
+fn object_tags_on_clipping_paths_and_the_tag_limit() {
+    let body = format!(
+        "0 Ae\nq\n{RED}{}W\nf\n/edge (clip) XT\n{}f\nQ\n/group (clipped) XT\n",
+        rect_path(5.0, 5.0, 25.0, 25.0),
+        rect_path(0.0, 0.0, 30.0, 30.0)
+    );
+    let doc = read_ok(&layer(&body)).doc;
+    let top = &art(&doc);
+    assert_eq!(top.len(), 1);
+    assert_eq!(tags(&top[0]).1, [tag("group", "clipped")]);
+    let tagged: Vec<_> = top[0].children().unwrap().iter().filter(|k| !tags(k).1.is_empty()).map(|k| k.kind.clone()).collect();
+    assert_eq!(tagged.len(), 1, "{tagged:?}");
+    assert!(matches!(tagged[0], NodeKind::Path { clipping: true, .. }), "{tagged:?}");
+    let many: String = (0..70).map(|i| format!("/t{i} ({i}) XT\n")).collect();
+    let body = format!("{}f\n{many}/AdobeURL (https://example.com) XT\n", rect_path(0.0, 0.0, 10.0, 10.0));
+    let (url, data) = tags(&art(&read_ok(&layer(&body)).doc)[0]);
+    assert_eq!(data.len(), 64);
+    assert_eq!(data.last(), Some(&tag("t63", "63")));
+    assert_eq!(url, "https://example.com", "the URL is kept past the limit");
+    // A tag whose identifier or string is longer than 64 KiB is ignored.
+    let long = "x".repeat(64 * 1024 + 1);
+    let body = format!("{}f\n/{long} (a) XT\n/b ({long}) XT\n/c (ok) XT\n", rect_path(0.0, 0.0, 10.0, 10.0));
+    assert_eq!(tags(&art(&read_ok(&layer(&body)).doc)[0]).1, [tag("c", "ok")]);
+}
+
+/// An image takes the tags after it, as any other object does.
+#[test]
+fn object_tags_after_an_image_are_its_own() {
+    let mut data = image("[ 10 0 0 10 50 90 ]", (1, 1), ("DeviceRGB", 3, 0), &[255, 0, 0], 3);
+    let at = data.windows(6).position(|w| w == b"N\r\nLB\r").unwrap();
+    data.splice(at..at, b"/AdobeURL (https://example.com/i) XT\r\n/sku (I-1) XT\r\n".iter().copied());
+    let r = read(&data).unwrap();
+    let a = art(&r.doc);
+    assert!(matches!(a[0].kind, NodeKind::Image(_)), "{a:#?}");
+    assert_eq!(tags(&a[0]), ("https://example.com/i".to_string(), vec![tag("sku", "I-1")]));
+}
+
+/// The state written after a group's end or a gradient mesh's `/End X!` is still theirs when the
+/// object's tags come first.
+#[test]
+fn object_tags_before_a_group_or_mesh_state_leave_it_theirs() {
+    let body = format!("{RED}0 Ae\nu\n0 0.5 0 0 0 Xy\n{}f\nU\n/hand (x) XT\n0 0 Xd\n6 () XW\n", rect_path(0.0, 0.0, 10.0, 10.0));
+    let doc = read_ok(&layer(&body)).doc;
+    assert_eq!((art(&doc)[0].opacity, tags(&art(&doc)[0]).1), (0.5, vec![tag("hand", "x")]));
+    let corner =
+        |x: i32, y: i32, next: (i32, i32), prev: (i32, i32)| format!("%_[1 1 1 1 {x} {y} {} {} 1 {} {} 1] /N X#\n", next.0, next.1, prev.0, prev.1);
+    let mesh = format!(
+        "/Mesh X!\n%_(DeviceRGB) /CS X#\n%_[0 0] /P X#\n{}{}{}{}%_0 /E X#\n/End X!\n",
+        corner(0, 0, (0, 10), (10, 0)),
+        corner(0, 40, (10, 40), (0, 30)),
+        corner(40, 40, (40, 30), (30, 40)),
+        corner(40, 0, (30, 0), (40, 10)),
+    );
+    let doc = read_ok(&layer(&format!("{mesh}/hand (y) XT\n1 0.35 0 0 0 Xy\n0 0 Xd\n6 () XW\n"))).doc;
+    let (m, l) = (&art(&doc)[0], &doc.layers[0]);
+    assert!(matches!(m.kind, NodeKind::Mesh(_)), "{m:#?}");
+    assert_eq!((m.opacity, m.blend, tags(m).1), (0.35, BlendMode::Multiply, vec![tag("hand", "y")]));
+    assert_eq!((l.opacity, l.blend), (1.0, BlendMode::Normal), "not the layer's");
+}
+
+/// The tags of an object whose drawn look stands for it (its style not found) stay with the look.
+#[test]
+fn a_drawn_look_keeps_its_objects_tags() {
+    let hidden_rect = rect_path(0.0, 0.0, 10.0, 10.0).replace('\n', "\n%_");
+    let body = format!(
+        "0 Ae\nu\n{RED}{}f\nU\n0 0 Xd\n6 () XW\n%_{hidden_rect}n\n%_/AdobeURL (https://example.com/n) XT\n%_/sku (N-1) XT\n1 (Gone style) XW\n",
+        rect_path(0.0, 0.0, 10.0, 10.0),
+    );
+    let r = read_ok(&layer(&body));
+    let a = art(&r.doc);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(tags(&a[0]), ("https://example.com/n".to_string(), vec![tag("sku", "N-1")]));
+    // A look with tags of its own keeps them, and takes the object's after them.
+    let a = art(&read_ok(&layer(&body.replace("U\n0 0 Xd", "U\n/own (L) XT\n0 0 Xd"))).doc);
+    assert_eq!(tags(&a[0]), ("https://example.com/n".to_string(), vec![tag("own", "L"), tag("sku", "N-1")]));
+}
+
+/// Tags in a brush's art don't keep it from being read, and stay out of the art: it isn't an object
+/// of the document.
+#[test]
+fn a_brushs_art_with_tags_is_read_without_them() {
+    let art_ = format!("%AI8_BeginBrushPattern\n(Dot art)\n0 A\n0 g\n{}f\n/sku (D-1) XT\n%AI8_EndBrushPattern\n", rect_path(0.0, 0.0, 4.0, 4.0));
+    let r = read_ok(&format!("{art_}{}{}", plugin_object(SCATTER, "Spray", SPRAY), layer("")));
+    let lib = vectorcraft_brush::library(&r.doc);
+    let vectorcraft_brush::BrushKind::Scatter(s) = brush_named(&lib, "Spray") else { panic!("scatter: {:?}", r.warnings) };
+    assert_eq!(s.art.geometric_bounds().map(|b| (b.width(), b.height())), Some((4.0, 4.0)));
+    assert!(s.art.extras().attrs.is_none(), "{:?}", s.art.extras().attrs);
 }
 
 #[test]
@@ -446,6 +611,46 @@ fn a_gradient_stop_naming_a_process_colour_leaves_its_swatch_process() {
 const DOTS: &str = "%AI3_BeginPattern: (Dots)\n(Dots) 0 0 8 8\n%_0 A\n%_0 Xw\n%_0 Ae\n%_u\n%_0 O\n%_0 8 m\n%_8 8 L\n%_8 0 L\n%_0 0 L\n%_0 8 L\n%_n\n\
                     %_0 R\n%_0 0 0 1 K\n%_1 J 0 j 2 w 4 M []0 d\n%_4 4 m\n%_4 4 L\n%_S\n%_U\n%_/ArtDictionary :\n%_;\n%_\n%_9 () XW\nE\n%AI3_EndPattern\n";
 
+/// An unpainted box that a pattern's definition marks as its tile's box isn't art; a painted one
+/// with the mark stays.
+#[test]
+fn a_patterns_marked_tile_box_is_not_art() {
+    let mark = "%_/ArtDictionary :\n%_1 /Bool (AIPattern_Editor_Backing_Tile_Rect) ,\n%_;\n%_\n";
+    let def = |paint: &str, op: &str| {
+        format!(
+            "%AI3_BeginPattern: (Box)\n(Box) 0 0 8 8\n%_0 A\n%_0 Xw\n%_{paint}0 XR\n%_0 8 m\n%_8 8 L\n%_8 0 L\n%_0 0 L\n%_0 8 L\n%_{op}\n{mark}\
+             %_0 0 0 1 k\n%_2 2 m\n%_6 2 L\n%_6 6 L\n%_2 6 L\n%_f\nE\n%AI3_EndPattern\n"
+        )
+    };
+    let layer = format!(
+        "%AI5_BeginLayer\n1 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n(L) Ln\n(Box) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\nLB\n%AI5_EndLayer--\n",
+        rect_path(10.0, 20.0, 70.0, 80.0)
+    );
+    let s = read_ok(&format!("{}{layer}", def("", "n")));
+    let art = &s.doc.pattern("Box").unwrap().art;
+    assert_eq!(art.len(), 1, "the square only");
+    assert_eq!(art[0].geometric_bounds(), Some(Rect::new(2.0, -6.0, 6.0, -2.0)));
+    let s = read_ok(&format!("{}{layer}", def("1 0 0 0 k\n%_", "f")));
+    assert_eq!(s.doc.pattern("Box").unwrap().art.len(), 2, "a painted box is art");
+    // The mark after a group or a compound path of an unpainted box leaves it in the art.
+    for (open, close, kind) in [("u", "U", "group"), ("*u", "*U", "compound path")] {
+        let def = format!(
+            "%AI3_BeginPattern: (Box)\n(Box) 0 0 8 8\n%_0 A\n%_0 Xw\n%_{open}\n%_0 8 m\n%_8 8 L\n%_8 0 L\n%_0 0 L\n%_0 8 L\n%_n\n%_{close}\n{mark}\
+             %_0 0 0 1 k\n%_2 2 m\n%_6 2 L\n%_6 6 L\n%_2 6 L\n%_f\nE\n%AI3_EndPattern\n"
+        );
+        let s = read_ok(&format!("{def}{layer}"));
+        assert_eq!(s.doc.pattern("Box").unwrap().art.len(), 2, "after a {kind}");
+    }
+    // Outside a pattern's definition the mark leaves the box in the art.
+    let marked = format!(
+        "%AI5_BeginLayer\n1 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n(L) Ln\n0 XR\n{}n\n{mark}0 0 0 1 k\n{}f\nLB\n%AI5_EndLayer--\n",
+        rect_path(10.0, 20.0, 70.0, 80.0),
+        rect_path(20.0, 30.0, 40.0, 50.0)
+    );
+    let s = read_ok(&marked);
+    assert_eq!(s.doc.layers[0].children().unwrap().len(), 2, "outside a pattern");
+}
+
 /// Patterns are read into pattern swatches, and `p` fills with one (#1025): the art keeps its
 /// layers, the fill places the tiles by its matrix.
 #[test]
@@ -525,7 +730,7 @@ fn a_gradient_in_a_patterns_definition_is_placed_from_the_canvas() {
 /// has that isn't read, where it shows. Its definition costs nothing else.
 #[test]
 fn a_pattern_it_cant_read_is_an_error_only_where_it_fills() {
-    let unread = "%AI3_BeginPattern: (Old)\n(Old) 0 0 8 8 [\n(0 O 0 R 0 g) @\n(\n0 0 m 8 8 L S\n) &\n] E\n%AI3_EndPattern\n\
+    let unread = "%AI3_BeginPattern: (Old)\n(Old) 0 0 8 8 [\n(0 O 0 R 0 g) @\n(\n0 0 m 8 8 L frobnicate S\n) &\n] E\n%AI3_EndPattern\n\
                   %AI3_BeginPattern: (Odd)\n(Odd) 0 0 8 8\n%_U\nE\n%AI3_EndPattern\n%AI3_BeginPattern: (Flat)\n(Flat) 0 0 8 0\n%_0 0 m\n%_8 0 L\n%_S\nE\n%AI3_EndPattern\n";
     let s = read_ok(&format!("{unread}{}", layer(&(rect_path(0.0, 0.0, 1.0, 1.0) + "f\n"))));
     assert!(s.doc.patterns.is_empty() && s.doc.swatches.iter().all(|w| !matches!(w.paint, Paint::Pattern { .. })));
@@ -562,6 +767,231 @@ fn a_pattern_painting_with_an_unread_pattern_is_not_kept() {
         let repainted = def.replace(&format!("{prefix}{tile}f"), &format!("{prefix}0 g\n{prefix}{tile}f"));
         let s = read_ok(&format!("{repainted}{}", layer(&(rect_path(0.0, 0.0, 1.0, 1.0) + "f\n"))));
         assert!(s.doc.pattern("Nest").is_some(), "{prefix:?}");
+    }
+}
+
+/// A pattern's definition inside another's isn't read, so the outer one isn't kept either.
+#[test]
+fn a_pattern_with_a_definition_inside_it_isnt_kept() {
+    let tile = rect_path(0.0, 0.0, 8.0, 8.0).replace('\n', "\n%_");
+    let inner = "%AI3_BeginPattern: (In)\n(In) 0 0 1 1\n%_0 0 m\n%_1 1 L\n%_S\nE\n%AI3_EndPattern\n";
+    let def = format!("%AI3_BeginPattern: (Out)\n(Out) 0 0 8 8\n{inner}%_{tile}f\nE\n%AI3_EndPattern\n");
+    let s = read_ok(&format!("{def}{}", layer("")));
+    assert!(s.doc.patterns.is_empty(), "{:?}", s.doc.patterns.iter().map(|p| &p.name).collect::<Vec<_>>());
+    // Without the definition inside it, it is kept.
+    let s = read_ok(&format!("{}{}", def.replace(inner, ""), layer("")));
+    assert!(s.doc.pattern("Out").is_some());
+}
+
+/// A definition whose art follows its head as operators is still read when that art starts with a
+/// dash array (`[]0 d`) off `%_` lines, which isn't a version 7 layer list.
+#[test]
+fn a_pattern_whose_art_starts_with_a_dash_array_is_read() {
+    let def = format!("%AI3_BeginPattern: (Dash)\n(Dash) 0 0 8 8 []0 d\n{}f\nE\n%AI3_EndPattern\n", rect_path(0.0, 0.0, 8.0, 8.0));
+    let s = read_ok(&format!("{def}{}", layer("")));
+    assert_eq!(s.doc.pattern("Dash").map(|p| p.art.len()), Some(1));
+}
+
+/// Editing data in the version 7 form: `%AI5_FileFormat 2.0`, the art size around the template
+/// box's center (an artboard 200 by 100 from the origin), `setup` (pattern definitions), then `body`.
+fn pattern_stream7(setup: &str, body: &str) -> String {
+    format!(
+        "%!PS-Adobe-3.0\n%%Creator: test\n%AI5_FileFormat 2.0\n%AI5_ArtSize: 200 100\n%AI3_TemplateBox: 100 50 100 50\n%%EndComments\n%%BeginProlog\n%%EndProlog\n%%BeginSetup\n{setup}%%EndSetup\n{body}\n%%PageTrailer\ngsave annotatepage grestore showpage\n%%Trailer\n%%EOF\n"
+    )
+}
+
+/// One layer named `name` with the version 7 form's ten operands before `Lb`, holding `art`.
+fn pattern_layer7(name: &str, art: &str) -> String {
+    format!("%AI5_BeginLayer\n1 1 1 1 0 0 0 79 128 255 Lb\n({name}) Ln\n0 A\n{art}LB\n%AI5_EndLayer--\n")
+}
+
+/// A definition of `name` in the version 7 form: its 20-point tile, then `layers`, the layer list.
+fn pattern7(name: &str, layers: &str) -> String {
+    format!("%AI3_BeginPattern: ({name})\n({name}) 0 0 20 20 [\n%AI3_Tile\n{layers}] E\n%AI3_EndPattern\n")
+}
+
+fn pattern_read7(setup: &str, body: &str) -> Structure {
+    match read(pattern_stream7(setup, body).as_bytes()) {
+        Ok(s) => s,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// A definition in the version 7 form (§3.4): each layer's colors (`@`) paint its tile's art (`&`),
+/// the first layer the lowest. The operator lines in the strings end in CR, and each layer starts
+/// from the definition's state, so the second layer's stroke doesn't take the first one's width.
+#[test]
+fn version_7_pattern_layers_paint_in_order_with_their_own_colors() {
+    let layers = "(0 O 0 R 1 0 0 0 k\r1 0 0 0 K) @\n(\r%AI6_BeginPatternLayer\r0 J 0 j 3 w 4 M []0 d\r2 2 m\r9 2 L\r9 9 L\r2 9 L\rf\r%AI6_EndPatternLayer\r) &\n\
+                  (0 O 1 R 0 0 0 1 k\r0 0 0 1 K) @\n(\r2 12 m\r18 12 L\rS\r) &\n";
+    let fill_with = format!("(Grid) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n", rect_path(10.0, 10.0, 90.0, 90.0));
+    let s = pattern_read7(&pattern7("Grid", layers), &pattern_layer7("Art", &fill_with));
+    assert!(s.unread.is_empty() && s.warnings.is_empty(), "{:?} {:?}", s.unread, s.warnings);
+    let def = s.doc.pattern("Grid").unwrap();
+    assert_eq!(def.tile, Rect::new(0.0, -20.0, 20.0, 0.0), "the tile, y down");
+    assert_eq!(def.art.len(), 2, "one path for each layer");
+    let (square, line) = (&def.art[0], &def.art[1]);
+    assert_eq!(square.geometric_bounds(), Some(Rect::new(2.0, -9.0, 9.0, -2.0)));
+    assert_eq!(fill(square).color(), Some(Color::cmyk(1.0, 0.0, 0.0, 0.0)));
+    assert!(square.appearance.stroke().is_none());
+    assert!(line.appearance.fill().is_none());
+    let stroke = line.appearance.stroke().unwrap();
+    assert_eq!(stroke.paint.color(), Some(Color::cmyk(0.0, 0.0, 0.0, 1.0)));
+    assert_eq!(stroke.width, 1.0, "the first layer's width stays with it");
+    assert!(stroke.overprint);
+    assert!(matches!(fill(&art(&s.doc)[0]), Paint::Pattern { pattern, .. } if pattern == "Grid"));
+}
+
+/// `_ &` fills the tile's box with the layer's fill color, without a stroke (§3.4).
+#[test]
+fn a_version_7_patterns_underbar_fills_the_tile_box() {
+    let layers = "(0 O 0 R 0 1 0 0 k 0 0 0 1 K) @ _ &\n(0 0 0 1 k 0 0 0 1 K) @ (2 2 m 18 18 L S) &\n";
+    let s = pattern_read7(&pattern7("Back", layers), &pattern_layer7("Art", ""));
+    let def = s.doc.pattern("Back").unwrap();
+    let back = &def.art[0];
+    assert_eq!(back.geometric_bounds(), Some(def.tile));
+    assert_eq!(fill(back).color(), Some(Color::cmyk(0.0, 1.0, 0.0, 0.0)));
+    assert!(back.appearance.stroke().is_none());
+    assert!(def.art[1].appearance.stroke().is_some());
+}
+
+/// A layer's strings are read with their escapes undone: `\r`, `\n`, an octal tab, a backslash at
+/// a line's end, and escaped parentheses around a custom color's name.
+#[test]
+fn a_version_7_patterns_strings_are_read_with_their_escapes_undone() {
+    let layers = "(0 O 0 R 0 0 0 1 \\(Ink \\(A\\)\\) 0 x) @\n(2 2 m\\r9 2 L\\n9 9 L\\0112 9 \\\nL f) &\n";
+    let s = pattern_read7(&pattern7("Ink", layers), &pattern_layer7("Art", ""));
+    let def = s.doc.pattern("Ink").unwrap();
+    assert_eq!(def.art.len(), 1);
+    assert_eq!(def.art[0].geometric_bounds(), Some(Rect::new(2.0, -9.0, 9.0, -2.0)));
+    assert!(s.doc.swatch("Ink (A)").is_some(), "{:?}", s.doc.swatches.iter().map(|w| &w.name).collect::<Vec<_>>());
+}
+
+/// A definition in the version 7 form that can't be read whole isn't kept, and a fill with it is
+/// something the file has that isn't read: an operator it doesn't know, type, a definition inside
+/// it, colors with other operators, a layer without its tile or its `&`, a string longer than the
+/// format allows, an `E`, a group or an array a layer doesn't end, more than 65,536 layers, a list
+/// without its `]` or its `E`, anything after its `E`.
+#[test]
+fn a_version_7_pattern_it_cant_read_whole_isnt_kept() {
+    let line = "(0 0 m 8 8 L S) &\n";
+    let long = format!("(0 g) @ ({}0 0 m 8 8 L S) &\n", " ".repeat(65_536));
+    let open = "%AI3_BeginPattern: (P)\n(P) 0 0 20 20 [\n(0 g) @ (0 0 m 8 8 L S) &\n";
+    let defs = [
+        pattern7("P", "(0 g) @ (0 0 m 8 8 L frobnicate S) &\n"),
+        pattern7("P", "(0 g) @ (0 To 1 0 0 1 2 2 0 Tp TP (a) Tx TO) &\n"),
+        pattern7("P", "(0 g) @ (\r%AI3_BeginPattern: (In)\r(In) 0 0 1 1\rE\r%AI3_EndPattern\r0 0 m 8 8 L S) &\n"),
+        pattern7("P", &format!("%AI3_BeginPattern: (In)\n(In) 0 0 1 1 [\n] E\n%AI3_EndPattern\n(0 g) @ {line}")),
+        pattern7("P", &format!("(0 g 0 0 m) @ {line}")),
+        pattern7("P", "(0 g) @\n"),
+        pattern7("P", "(0 g) @ _\n"),
+        pattern7("P", &long),
+        pattern7("P", "(0 g) @ (0 0 m 8 8 L S E) &\n"),
+        pattern7("P", "(0 g) @ (u 0 0 m 8 8 L S) &\n"),
+        pattern7("P", "(0 g) @ (0 0 m 8 8 L S [) &\n"),
+        pattern7("P", "(0 g) @ ([ 0 0 m 8 8 L S) &\n"),
+        pattern7("P", &"(0 g) @ _ &\n".repeat(65_537)),
+        format!("{open}E\n%AI3_EndPattern\n"),
+        format!("{open}]\n%AI3_EndPattern\n"),
+        format!("{open}] E\n0 0 m 8 8 L S\n%AI3_EndPattern\n"),
+    ];
+    let fill_with = format!("(P) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n", rect_path(0.0, 0.0, 1.0, 1.0));
+    for (i, def) in defs.iter().enumerate() {
+        assert!(pattern_read7(def, &pattern_layer7("Art", "")).doc.patterns.is_empty(), "case {i}");
+        assert_unread(&pattern_read7(def, &pattern_layer7("Art", &fill_with)), "pattern fills");
+    }
+    // The same definition, whole, is kept.
+    let s = pattern_read7(&pattern7("P", &format!("(0 g) @ {line}")), &pattern_layer7("Art", &fill_with));
+    assert!(s.doc.pattern("P").is_some() && s.unread.is_empty());
+}
+
+/// With a pattern defined in the version 7 form, a fill's other operands are applied in order
+/// before its initial matrix (§5.4.1): the shear along its axis, the reflection about the line at
+/// its angle, the rotation, the scale, then the offset. Identity ones move the tiles by the offset
+/// alone. `P` places a stroke's tiles the same way.
+#[test]
+fn a_pattern_fill_applies_its_offset_scale_rotation_reflection_and_shear() {
+    let def = pattern7("Grid", "(0 g) @ _ &\n");
+    // The operands, and the pattern's space → art space they make (a b c d e f).
+    let cases = [
+        ("10 15 1 1 0 0 0 0 0 [1 0 0 1 0 0]", [1.0, 0.0, 0.0, 1.0, 10.0, 15.0]),
+        ("25 30 1.5 .75 30 1 45 10 0 [1 0 0 1 0 0]", [-0.75, 0.649519, 1.166793, 0.489528, 25.0, 30.0]),
+        ("-5 7 2 .5 -45 0 0 -15 45 [1 0 0 1 0 0]", [1.793151, -0.353553, 1.035276, 0.353553, -5.0, 7.0]),
+        ("3 -4 1.2 .8 20 1 30 12 25 [.8 .1 -.2 1.1 4 -6]", [-0.028557, 0.816531, 1.054026, 0.117492, 7.2, -10.1]),
+    ];
+    // Art space → the document (the artboard is 100 high), and a tile's art (y down from its top
+    // left) → the pattern's space.
+    let space = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 100.0]);
+    let tile = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 20.0]);
+    for (ops, want) in cases {
+        for (op, paint) in [("p", "f"), ("P", "S")] {
+            let s = pattern_read7(&def, &pattern_layer7("Art", &format!("(Grid) {ops} {op}\n{}{paint}\n", rect_path(10.0, 10.0, 90.0, 90.0))));
+            let node = &art(&s.doc)[0];
+            let p = if op == "p" { fill(node) } else { node.appearance.stroke().unwrap().paint.clone() };
+            let Paint::Pattern { xf, .. } = p else { panic!("{ops} {op}: {p:?}") };
+            let got = (space.inverse() * xf * tile.inverse()).as_coeffs();
+            assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-6), "{ops} {op}: {got:?}");
+        }
+    }
+    // The tiles' corners: with identity operands but the offset, the tile's top left (0, 20) is at
+    // (10, 35) in art space; with the last ones, its lower right (20, 0) is at (6.628860, 6.230623).
+    let placed = |ops: &str| {
+        let s = pattern_read7(&def, &pattern_layer7("Art", &format!("(Grid) {ops} p\n{}f\n", rect_path(10.0, 10.0, 90.0, 90.0))));
+        let Paint::Pattern { xf, .. } = fill(&art(&s.doc)[0]) else { panic!() };
+        xf
+    };
+    assert_eq!(placed(cases[0].0) * Point::ZERO, Point::new(10.0, 65.0));
+    assert!((placed(cases[3].0) * Point::new(20.0, 20.0)).distance(Point::new(6.628860, 93.769377)) < 1e-5);
+    // Without its nine operands, a fill with the pattern isn't read.
+    let r = pattern_read7(&def, &pattern_layer7("Art", &format!("(Grid) 0 0 1 1 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n", rect_path(10.0, 10.0, 90.0, 90.0))));
+    assert_unread(&r, "pattern fills");
+}
+
+/// With a pattern defined in the newer form (art on `%_` lines), the matrix alone places the tiles
+/// (#1025): the other operands don't move them, and a fill without all nine is still read.
+#[test]
+fn a_newer_pattern_fill_is_placed_by_its_matrix_alone() {
+    let placed = |ops: &str| {
+        let s = read_ok(&format!("{DOTS}{}", layer(&format!("(Dots) {ops} p\n{}f\n", rect_path(10.0, 20.0, 70.0, 80.0)))));
+        assert!(s.unread.is_empty() && s.warnings.is_empty(), "{ops}: {:?} {:?}", s.unread, s.warnings);
+        let Paint::Pattern { xf, .. } = fill(&art(&s.doc)[0]) else { panic!("{ops}: {:?}", fill(&art(&s.doc)[0])) };
+        xf
+    };
+    let plain = placed("0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0]");
+    assert_eq!(plain * Point::ZERO, Point::new(0.0, 92.0));
+    assert_eq!(placed("25 30 1.5 .75 30 1 45 10 0 [1 0 0 1 0 0]"), plain);
+    assert_eq!(placed("0 0 1 1 0 0 0 0 [1 0 0 1 0 0]"), plain);
+}
+
+/// An art style `Tiled` whose fill is `(name) {ops} p`.
+fn tiled_style(name: &str, ops: &str) -> String {
+    format!(
+        "%AI9_BeginArtStyles\n/KnownStyle :\n(Tiled) /Name ,\n/ActiveStyle :\n/CompoundFilter :\n(Chain Style Filter) 0 0 /Filter ,\n1 /Visible ,\n\
+         /CompoundFilter :\n(Stack Style Filter) 0 0 /Filter ,\n1 /Visible ,\n\
+         /BasicFilter :\n(Fill Style Filter) 0 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n/FillStyle : 0 O\n({name}) {ops} p\n0 1 Xd\n/Def ;\n (FillStyle) ,\n; /Dict ;\n /Part ,\n\
+         /BasicFilter :\n(Conduit Filter) 0 0 /Filter ,\n1 /Visible ,\n;\n /Part ,\n;\n /Part ,\n;\n%AI9_EndArtStyles\n"
+    )
+}
+
+/// A fill set through an art style on a text object places the tiles as a `p` fill with the same
+/// operands does: with the other operands before the matrix for a pattern defined in the version 7
+/// form, by the matrix alone for one defined in the newer form.
+#[test]
+fn a_style_pattern_fill_is_placed_as_a_direct_one() {
+    let rect = rect_path(10.0, 20.0, 70.0, 80.0);
+    // The text object's drawn look (without a pattern to take the placement from), then the object.
+    let look = "0 Ae\nu\n/AI11Text :\n1 /FreeUndo ,\n0 /FrameIndex ,\n0 /StoryIndex ,\n;\nU\n";
+    let own = "%_/AI11Text :\n%_0 /FreeUndo ,\n%_0 /FrameIndex ,\n%_0 /StoryIndex ,\n%_;\n";
+    let ops = "25 30 1.5 .75 30 1 45 10 0 [.8 .1 -.2 1.1 4 -6]";
+    for (name, def) in [("Grid", pattern7("Grid", "(0 g) @ _ &\n")), ("Dots", DOTS.to_string())] {
+        let styled = read_ok(&format!("{}{def}{}", tiled_style(name, ops), layer(&format!("{look}{own}1 (Tiled) XW\n"))));
+        let direct = read_ok(&format!("{def}{}", layer(&format!("({name}) {ops} p\n{rect}f\n"))));
+        let xf = |s: &Structure| match fill(&art(&s.doc)[0]) {
+            Paint::Pattern { xf, .. } => xf,
+            p => panic!("{name}: {p:?} {:?} {:?}", s.unread, s.warnings),
+        };
+        let (got, want) = (xf(&styled).as_coeffs(), xf(&direct).as_coeffs());
+        assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-9), "{name}: {got:?} {want:?}");
     }
 }
 
@@ -729,6 +1159,30 @@ fn a_layer_keeps_its_own_transparency() {
         assert!(matches!(art(&doc)[0].kind, NodeKind::Mesh(_)), "{after:?}");
         assert_eq!((l.opacity, l.blend), layer_state, "the layer's state after {after:?}");
         assert_eq!((art(&doc)[0].opacity, art(&doc)[0].blend), mesh_state, "the mesh's state after {after:?}");
+    }
+}
+
+#[test]
+fn a_layers_state_after_its_last_group_or_compound_path_is_the_layers() {
+    // GUARDS: the layer's `Xy` right after its last group or compound path, before the layer's
+    // `0 0 Xd` and `7 () XW`, went to that group or compound path, and the layer stayed opaque.
+    let a = rect_path(0.0, 0.0, 10.0, 10.0);
+    let b = rect_path(2.0, 2.0, 8.0, 8.0);
+    let layer_block = "1 0.6 1 2 1 Xy\n0 0 Xd\n7 () XW\n";
+    for last in [format!("0 Ae\nu\n{RED}{a}f\nU\n"), format!("0 Ae\n*u\n{RED}{a}f\n{b}f\n*U\n")] {
+        let doc = read_ok(&layer(&format!("{last}{layer_block}"))).doc;
+        let l = &doc.layers[0];
+        assert_eq!(
+            (l.opacity, l.blend, l.isolate, l.knockout, l.knockout_shape),
+            (0.6, BlendMode::Multiply, true, Knockout::Neutral, true),
+            "{last}"
+        );
+        let n = &art(&doc)[0];
+        assert_eq!((n.opacity, n.blend, n.isolate, n.knockout_shape), (1.0, BlendMode::Normal, false, false), "{last}");
+        // The group's own state block (`6 () XW`) keeps it the group's.
+        let doc = read_ok(&layer(&format!("{last}1 0.6 1 2 1 Xy\n0 0 Xd\n6 () XW\n"))).doc;
+        assert_eq!(doc.layers[0].opacity, 1.0, "{last}");
+        assert_eq!((art(&doc)[0].opacity, art(&doc)[0].knockout_shape), (0.6, true), "{last}");
     }
 }
 
@@ -1151,34 +1605,341 @@ fn art_after_the_printers_crop_marks_reads() {
     assert_eq!(art(&doc).len(), 1);
 }
 
-/// A variable library in the document data isn't read: a note gives how many variables and data
-/// sets it has, counting the elements of the library alone (a data set's element for a variable named
-/// `variable` isn't a variable).
-#[test]
-fn a_variable_library_is_noted_with_its_counts() {
-    use vectorcraft_testkit::ai::variable_library;
+/// The document data `library` (a `variableSets` element) read with a layer holding a square: the
+/// variables read and the notes about the library.
+fn read_library(library: &str) -> (vectorcraft_doc::Variables, Vec<String>) {
     let square = layer(&format!("{RED}{}f\n", rect_path(0.0, 0.0, 10.0, 10.0)));
-    let notes = |library: &str| read_ok(&format!("{library}{square}")).warnings.into_iter().filter(|w| w.contains("variables")).collect::<Vec<_>>();
+    let r = read_ok(&format!("{}{square}", vectorcraft_testkit::ai::variable_library_data(library)));
+    let notes = r.warnings.into_iter().filter(|w| w.contains("variable library")).collect();
+    ((*r.doc.variables).clone(), notes)
+}
+
+/// The note of a library read but for `n` entries.
+fn partly_read(n: usize) -> String {
+    format!("the file's variable library was partly read (entries skipped: {n}): the Variables panel lists the rest")
+}
+
+/// A variable library in the document data comes in with its variables in order, each of the kind
+/// its trait gives (a variable without one is of unknown kind), and without bindings. A library
+/// read whole gives no note.
+#[test]
+fn ai_variable_library_definitions() {
+    use vectorcraft_doc::VariableKind;
+    let (vars, notes) = read_library(&vectorcraft_testkit::ai::sample_variable_sets("none", &[]));
+    let kinds: Vec<(&str, VariableKind)> = vars.variables.iter().map(|v| (v.name.as_str(), v.kind)).collect();
     assert_eq!(
-        notes(&variable_library(&["variable", "Team"], &["Home", "Away", "Third"])),
-        ["the file's variables and data sets weren't read (variables: 2, data sets: 3): the Variables panel doesn't list them"]
+        kinds,
+        [
+            ("v_text", VariableKind::Text),
+            ("v_visible", VariableKind::Visibility),
+            ("v_file", VariableKind::Image),
+            ("v_graph", VariableKind::Graph),
+            ("v_unbound", VariableKind::Unknown)
+        ]
     );
+    assert!(vars.bindings.is_empty());
+    assert!(notes.is_empty(), "{notes:?}");
+    // The library of the testkit's text variables, and an empty one.
+    let square = layer(&format!("{RED}{}f\n", rect_path(0.0, 0.0, 10.0, 10.0)));
+    let r = read_ok(&format!("{}{square}", vectorcraft_testkit::ai::variable_library(&["variable", "Team"], &["Home", "Away"])));
+    let names: Vec<&str> = r.doc.variables.variables.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["variable", "Team"], "{:?}", r.warnings);
+    assert_eq!(r.doc.variables.dataset("Away").and_then(|d| d.values.get("Team")), Some(&vectorcraft_doc::DataValue::Text("Away Team".into())));
+    let r = read_ok(&format!("{}{square}", vectorcraft_testkit::ai::variable_library(&[], &[])));
+    assert_eq!(*r.doc.variables, vectorcraft_doc::Variables::default());
+    assert!(!r.warnings.iter().any(|w| w.contains("variable")), "{:?}", r.warnings);
+}
+
+/// The objects a variable is bound to come with the library, each by the XML id its `docRef` gives,
+/// in the order the library declares them: a variable bound to two objects is declared twice and
+/// comes in once. A `docRef` that isn't an XML id is kept as unreadable, a declaration without one
+/// binds nothing, and a second variable of the same name and another kind is left out with a note,
+/// its binding counted as left out.
+/// The objects read keep their XML ids; an id two objects have names neither of them.
+#[test]
+fn ai_variable_library_bindings() {
+    use vectorcraft_testkit::ai::{XmlValue, named, variable_library_data, xml_element, xml_node};
+    let declare = |name: &str, t: &str, art: Option<XmlValue>| {
+        let mut attributes = vec![("trait", XmlValue::Str(t)), ("varName", XmlValue::Unicode(name))];
+        attributes.extend(art.map(|a| ("docRef", a)));
+        xml_node(1, "variable", XmlValue::Str(""), &attributes, &[])
+    };
+    let declared = vec![
+        declare("v_shown", "visibility", Some(XmlValue::Raw("/XMLUIDREF : (one) ;"))),
+        declare("v_text", "textcontent", Some(XmlValue::Str("one"))),
+        declare("v_shown", "visibility", Some(XmlValue::Raw("/XMLUIDREF : (two) ;"))),
+        declare("v_shown", "textcontent", Some(XmlValue::Raw("/XMLUIDREF : (two) ;"))),
+        declare("v_free", "visibility", None),
+    ];
+    let set = xml_element("variableSet", &[("locked", "none")], &[xml_element("variables", &[], &declared)]);
+    let library = variable_library_data(&xml_element("variableSets", &[], &[set]));
+    let square = |x: f64, id: &str| format!("{RED}{}f\n{}", rect_path(x, 0.0, x + 10.0, 10.0), named(id));
+    let squares = layer(&[square(0.0, "one"), square(20.0, "two"), square(40.0, "twice"), square(60.0, "twice")].concat());
+    let r = read_ok(&format!("{library}{squares}"));
+    let names: Vec<&str> = r.doc.variables.variables.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["v_shown", "v_text", "v_free"]);
+    let refs: Vec<(&str, Option<&str>)> = r.bindings.iter().map(|b| (b.variable.as_str(), b.target.as_deref())).collect();
+    assert_eq!(refs, [("v_shown", Some("one")), ("v_text", None), ("v_shown", Some("two"))]);
+    assert!(r.warnings.contains(&partly_read(1)), "{:?}", r.warnings);
+    // The object the declaration left out binds is counted for the bindings' note.
+    assert_eq!(r.bindings_skipped, 1);
+    // The reader doesn't bind them: the importer does, with the objects it keeps.
+    assert!(r.doc.variables.bindings.is_empty());
+    let ids: Vec<vectorcraft_doc::NodeId> = art(&r.doc).iter().map(|n| n.id).collect();
+    assert_eq!(r.xml_ids.get("one"), Some(&Some(ids[0])));
+    assert_eq!(r.xml_ids.get("two"), Some(&Some(ids[1])));
+    assert_eq!(r.xml_ids.get("twice"), Some(&None));
+}
+
+/// The bindings count against the library's 8 MB of names and values: each one keeps its
+/// variable's name and its target. The declarations past that bind nothing and are counted as left
+/// out.
+#[test]
+fn ai_variable_library_bindings_stay_within_the_byte_budget() {
+    use vectorcraft_testkit::ai::{XmlValue, variable_library_data, xml_element, xml_node};
+    let (name, id) = ("é".repeat(255), "a".repeat(255));
+    let target = format!("/XMLUIDREF : ({id}) ;");
+    let declare = || {
+        xml_node(
+            1,
+            "variable",
+            XmlValue::Str(""),
+            &[("trait", XmlValue::Str("visibility")), ("varName", XmlValue::Unicode(&name)), ("docRef", XmlValue::Raw(&target))],
+            &[],
+        )
+    };
+    let declared: Vec<_> = (0..11_500).map(|_| declare()).collect();
+    let set = xml_element("variableSet", &[("locked", "none")], &[xml_element("variables", &[], &declared)]);
+    let square = layer(&format!("{RED}{}f\n", rect_path(0.0, 0.0, 10.0, 10.0)));
+    let r = read_ok(&format!("{}{square}", variable_library_data(&xml_element("variableSets", &[], &[set]))));
+    assert_eq!(r.doc.variables.variables.len(), 1);
+    // The variable's name, then each binding's name and target.
+    let kept = ((8 << 20) - name.len()) / (name.len() + id.len());
+    assert_eq!(r.bindings.len(), kept);
+    assert_eq!(r.bindings_skipped, 11_500 - kept);
+}
+
+/// The data sets come in in order with their values: text of one paragraph per `p` element (`&`,
+/// `<` and accented letters as they are), whether the objects show, and a linked file's path from
+/// its URL, kept when it names no file. A variable of unknown kind has no value.
+#[test]
+fn ai_variable_library_dataset_values() {
+    use vectorcraft_doc::DataValue;
+    use vectorcraft_testkit::ai::{SAMPLE_MISSING_FILE, sample_variable_sets};
+    let (vars, notes) = read_library(&sample_variable_sets("none", &[]));
+    assert!(notes.is_empty(), "{notes:?}");
+    let names: Vec<&str> = vars.datasets.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["ds_one", "ds_two", "ds_three"]);
+    let two = &vars.datasets[1].values;
+    assert_eq!(two.get("v_text"), Some(&DataValue::Text("line one\nline two & < é".into())));
+    assert_eq!(two.get("v_visible"), Some(&DataValue::Visible(false)));
+    assert_eq!(two.get("v_file"), Some(&DataValue::Image(SAMPLE_MISSING_FILE.into())));
+    assert!(!std::path::Path::new(SAMPLE_MISSING_FILE).exists());
+    assert_eq!(two.len(), 3, "{two:?}");
+    let one = &vars.datasets[0].values;
+    assert_eq!(one.get("v_text"), Some(&DataValue::Text("one".into())));
+    assert_eq!(one.get("v_visible"), Some(&DataValue::Visible(true)));
+    assert_eq!(one.get("v_file"), Some(&DataValue::Image("/Users/test/Art (one)/tile-a.eps".into())));
+}
+
+/// A data set's value element can carry a namespace prefix.
+#[test]
+fn ai_variable_library_dataset_values_with_a_prefix() {
+    use vectorcraft_doc::DataValue;
+    use vectorcraft_testkit::ai::sample_variable_sets;
+    let library = sample_variable_sets("none", &[]).replace("%_(v_visible) /String (xmlnode-nodename)", "%_(c:v_visible) /String (xmlnode-nodename)");
+    assert!(library.contains("c:v_visible"));
+    let (vars, notes) = read_library(&library);
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(vars.datasets[0].values.get("v_visible"), Some(&DataValue::Visible(true)));
+    assert_eq!(vars.datasets[1].values.get("v_visible"), Some(&DataValue::Visible(false)));
+}
+
+/// The data set shown comes in as the active one, and the lock as it was set.
+#[test]
+fn ai_variable_library_state() {
+    use vectorcraft_testkit::ai::sample_variable_sets;
+    let (vars, notes) = read_library(&sample_variable_sets("variableAndTypes", &[]));
+    assert_eq!(vars.active_dataset.as_deref(), Some("ds_two"));
+    assert!(vars.locked, "{notes:?}");
+    assert!(notes.is_empty(), "{notes:?}");
+    let (vars, _) = read_library(&sample_variable_sets("none", &[]));
+    assert!(!vars.locked);
+    assert_eq!(vars.active_dataset.as_deref(), Some("ds_two"));
+    // A lock VectorCraft doesn't know reads as unlocked, with a note.
+    let (vars, notes) = read_library(&sample_variable_sets("everything", &[]));
+    assert!(!vars.locked);
+    assert_eq!(notes, [partly_read(1)]);
+    // A data set shown that isn't one of the library's leaves none active.
+    let library = sample_variable_sets("none", &[]).replace("%_(ds_two) /UnicodeString (xmlnode-nodevalue) ,\n%_2 /Int (xmlnode-nodetype) ,\n%_/Array :\n%_; (xmlnode-children) ,\n%_/Dictionary :\n%_; (xmlnode-attributes) ,\n%_; (i:activeDataSet)", "%_(ds_nine) /UnicodeString (xmlnode-nodevalue) ,\n%_2 /Int (xmlnode-nodetype) ,\n%_/Array :\n%_; (xmlnode-children) ,\n%_/Dictionary :\n%_; (xmlnode-attributes) ,\n%_; (i:activeDataSet)");
+    assert!(library.contains("ds_nine"));
+    let (vars, notes) = read_library(&library);
+    assert_eq!(vars.active_dataset, None);
+    assert_eq!(vars.datasets.len(), 3, "{notes:?}");
+}
+
+/// A value that can't be read is left out with a note, and the values and data sets after it still
+/// come in.
+#[test]
+fn ai_variable_library_bad_sibling() {
+    use vectorcraft_doc::DataValue;
+    use vectorcraft_testkit::ai::{XmlValue, sample_variable_sets, xml_element, xml_text};
+    // A value for a variable the library doesn't declare, and a second value for `v_visible`.
+    let more = [xml_element("v_nope", &[], &[xml_text(XmlValue::Str("x"))]), xml_element("v_visible", &[], &[xml_text(XmlValue::Bool(true))])];
+    let (vars, notes) = read_library(&sample_variable_sets("none", &more));
+    assert_eq!(notes, [partly_read(2)]);
+    assert_eq!(vars.datasets[1].values.get("v_visible"), Some(&DataValue::Visible(false)));
+    assert_eq!(vars.datasets[2].values.get("v_text"), Some(&DataValue::Text("three".into())));
+    assert_eq!(vars.active_dataset.as_deref(), Some("ds_two"));
+}
+
+/// A graph variable comes in, but its values aren't read: each is left out with a note.
+#[test]
+fn ai_variable_library_graph_partial() {
+    use vectorcraft_doc::VariableKind;
+    use vectorcraft_testkit::ai::{XmlValue, sample_variable_sets, xml_element, xml_text};
+    let graph = xml_element("v_graph", &[], &[xml_text(XmlValue::Str("a,b\n1,2"))]);
+    let (vars, notes) = read_library(&sample_variable_sets("none", &[graph]));
+    assert_eq!(notes, [partly_read(1)]);
+    assert_eq!(vars.variable("v_graph").map(|v| v.kind), Some(VariableKind::Graph));
+    assert!(vars.datasets.iter().all(|d| !d.values.contains_key("v_graph")));
+    assert_eq!(vars.datasets[1].values.len(), 3);
+}
+
+/// Declarations, data sets and values that are malformed, repeated or past the caps are left out
+/// and counted; a value is never read as one of another kind. A library nothing can be read from
+/// says so.
+#[test]
+fn ai_variable_library_edge_cases() {
+    use vectorcraft_doc::{DataValue, VariableKind};
+    use vectorcraft_testkit::ai::{XmlValue, xml_element, xml_node, xml_text};
+    let set = |locked: &str, declared: Vec<String>, rows: Vec<String>| {
+        let sets = xml_element("v:sampleDataSets", &[], &rows);
+        xml_element("variableSets", &[], &[xml_element("variableSet", &[("locked", locked)], &[xml_element("variables", &[], &declared), sets])])
+    };
+    let var = |name: &str, t: &str| xml_element("variable", &[("varName", name), ("trait", t)], &[]);
+    let declared = vec![
+        var("A", "textcontent"),
+        // The same name again, no name, an empty one, one that is too long, and an attribute node
+        // whose name isn't text.
+        var("A", "visibility"),
+        xml_element("variable", &[("trait", "textcontent")], &[]),
+        var("  ", "textcontent"),
+        var(&"n".repeat(256), "textcontent"),
+        xml_node(1, "variable", XmlValue::Str(""), &[("varName", XmlValue::Bool(true))], &[]),
+        // A trait VectorCraft doesn't know: unknown kind.
+        var("Fancy", "sparkle"),
+        var("Shown", "visibility"),
+        var("File", "fileref"),
+        // Something that isn't a variable.
+        xml_element("note", &[], &[]),
+    ];
+    let rows = vec![
+        xml_element(
+            "v:sampleDataSet",
+            &[("dataSetName", "One")],
+            &[
+                xml_element("A", &[], &[xml_element("p", &[], &[xml_text(XmlValue::Unicode(" spaced "))]), xml_element("p", &[], &[])]),
+                // A value for the unknown kind, a visibility that is text, a file that is a relative
+                // path.
+                xml_element("Fancy", &[], &[xml_text(XmlValue::Str("x"))]),
+                xml_element("Shown", &[], &[xml_text(XmlValue::Str("true"))]),
+                xml_element("File", &[], &[xml_text(XmlValue::Str("art/tile.eps"))]),
+            ],
+        ),
+        // The same data set again, and one without a name.
+        xml_element("v:sampleDataSet", &[("dataSetName", "One")], &[]),
+        xml_element("v:sampleDataSet", &[], &[]),
+        xml_element(
+            "v:sampleDataSet",
+            &[("dataSetName", "Two")],
+            &[
+                // Text whose paragraph holds an element, a file on a drive, a visibility of two texts.
+                xml_element("A", &[], &[xml_element("p", &[], &[xml_element("b", &[], &[])])]),
+                xml_element("File", &[], &[xml_text(XmlValue::Str("file:///C:/My%20Art/50%off.eps"))]),
+                xml_element("Shown", &[], &[xml_text(XmlValue::Bool(true)), xml_text(XmlValue::Bool(false))]),
+            ],
+        ),
+    ];
+    let (vars, notes) = read_library(&set("none", declared, rows));
+    let kinds: Vec<(&str, VariableKind)> = vars.variables.iter().map(|v| (v.name.as_str(), v.kind)).collect();
     assert_eq!(
-        notes(&variable_library(&["Team"], &["Home"])),
-        ["the file's variables and data sets weren't read (variables: 1, data sets: 1): the Variables panel doesn't list them"]
+        kinds,
+        [("A", VariableKind::Text), ("Fancy", VariableKind::Unknown), ("Shown", VariableKind::Visibility), ("File", VariableKind::Image)]
     );
-    assert!(notes(&variable_library(&[], &[])).is_empty(), "an empty library gives no warning");
-    assert!(notes("").is_empty());
-    // When the reader can't read the layers, `variables` still counts the library, for the warning
-    // of the file read from its PDF part.
-    let unread = stream(&format!("{}{}", variable_library(&["Team"], &["Home", "Away"]), layer("1 Zz\n")));
+    let names: Vec<&str> = vars.datasets.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["One", "Two"]);
+    let one = &vars.datasets[0].values;
+    assert_eq!(one.get("A"), Some(&DataValue::Text(" spaced \n".into())));
+    assert_eq!(one.len(), 1, "{one:?}");
+    let two = &vars.datasets[1].values;
+    assert_eq!(two.get("File"), Some(&DataValue::Image("C:/My Art/50%off.eps".into())));
+    assert_eq!(two.len(), 1, "{two:?}");
+    // 6 declarations, 2 data sets and 5 values.
+    assert_eq!(notes, [partly_read(13)]);
+
+    // Children that aren't an array: nothing can be read.
+    let broken = xml_element("variableSets", &[], &[xml_element("variableSet", &[], &[])]).replace(
+        "%_/Array :\n%_; (xmlnode-children) ,\n%_/Dictionary :\n%_; (xmlnode-attributes) ,\n%_; ,",
+        "%_/Dictionary :\n%_; (xmlnode-children) ,\n%_/Dictionary :\n%_; (xmlnode-attributes) ,\n%_; ,",
+    );
+    assert!(broken.contains("%_/Dictionary :\n%_; (xmlnode-children)"));
+    let (vars, notes) = read_library(&broken);
+    assert_eq!(vars, vectorcraft_doc::Variables::default());
+    assert_eq!(notes, ["the file's variable library couldn't be read: the Variables panel doesn't list it"]);
+
+    // Past the caps: 256 variables and 1,000 data sets are kept.
+    let declared: Vec<String> = (0..257).map(|i| var(&format!("v{i}"), "textcontent")).collect();
+    let rows: Vec<String> = (0..1001).map(|i| xml_element("v:sampleDataSet", &[("dataSetName", &format!("d{i}"))], &[])).collect();
+    let (vars, notes) = read_library(&set("none", declared, rows));
+    assert_eq!((vars.variables.len(), vars.datasets.len()), (256, 1000));
+    assert_eq!(notes, [partly_read(2)]);
+    // A text longer than the library's 8 MiB is left out, and so is text past what is left of them.
+    let long = |name: &str, len: usize| {
+        let text = xml_element("p", &[], &[xml_text(XmlValue::Str(&"x".repeat(len)))]);
+        xml_element("v:sampleDataSet", &[("dataSetName", name)], &[xml_element("A", &[], &[text])])
+    };
+    let rows = vec![long("Big", (8 << 20) + 1), long("Half", 5 << 20), long("More", 4 << 20)];
+    let (vars, notes) = read_library(&set("none", vec![var("A", "textcontent")], rows));
+    let held: Vec<(&str, usize)> = vars.datasets.iter().map(|d| (d.name.as_str(), d.values.len())).collect();
+    assert_eq!(held, [("Big", 0), ("Half", 1), ("More", 0)]);
+    assert_eq!(notes, [partly_read(2)]);
+    // Linked files on a network share, and on `localhost`.
+    let file = |name: &str, url: &str| {
+        xml_element("v:sampleDataSet", &[("dataSetName", name)], &[xml_element("File", &[], &[xml_text(XmlValue::Str(url))])])
+    };
+    let rows = vec![file("Share", "file://server/My%20Share/a.eps"), file("Local", "file://localhost/Users/test/a.eps")];
+    let (vars, notes) = read_library(&set("none", vec![var("File", "fileref")], rows));
+    let paths: Vec<Option<&DataValue>> = vars.datasets.iter().map(|d| d.values.get("File")).collect();
+    assert_eq!(paths, [Some(&DataValue::Image("//server/My Share/a.eps".into())), Some(&DataValue::Image("/Users/test/a.eps".into()))]);
+    assert!(notes.is_empty(), "{notes:?}");
+    // A library whose only node isn't a variable set.
+    let (_, notes) = read_library(&xml_element("variableSets", &[], &[xml_element("note", &[], &[])]));
+    assert_eq!(notes, ["the file's variable library couldn't be read: the Variables panel doesn't list it"]);
+    // A second variable set is left out.
+    let two_sets = xml_element("variableSets", &[], &[xml_element("variableSet", &[], &[]), xml_element("variableSet", &[], &[])]);
+    let (_, notes) = read_library(&two_sets);
+    assert_eq!(notes, ["the file's variable library couldn't be read: the Variables panel doesn't list it"]);
+}
+
+/// When the layers can't be read, or reading stops before the library, [`variables`] still reads
+/// it, for the file read from its PDF part.
+#[test]
+fn ai_variable_library_without_the_layers() {
+    use vectorcraft_testkit::ai::{sample_variable_sets, variable_library_data};
+    let square = layer(&format!("{RED}{}f\n", rect_path(0.0, 0.0, 10.0, 10.0)));
+    let library = variable_library_data(&sample_variable_sets("variableAndTypes", &[]));
+    let unread = stream(&format!("{library}{}", layer("1 Zz\n")));
     assert!(read(unread.as_bytes()).is_err());
-    assert_eq!(variables(unread.as_bytes()), read::VariableLibrary { variables: 1, data_sets: 2 });
-    // The same when the reading stops before it reaches the library (at an `LB` without its layer).
-    let early = stream(&format!("LB\n{}{square}", variable_library(&["Team"], &["Home", "Away"])));
+    let found = variables(unread.as_bytes());
+    assert!(found.present && found.variables.locked && found.skipped == 0);
+    assert_eq!((found.variables.variables.len(), found.variables.datasets.len()), (5, 3));
+    assert_eq!(found.variables.active_dataset.as_deref(), Some("ds_two"));
+    // The reading stops before it reaches the library (at an `LB` without its layer).
+    let early = stream(&format!("LB\n{library}{square}"));
     assert!(read(early.as_bytes()).is_err());
-    assert_eq!(variables(early.as_bytes()), read::VariableLibrary { variables: 1, data_sets: 2 });
-    assert_eq!(variables(stream(&square).as_bytes()), read::VariableLibrary::default());
+    assert_eq!(variables(early.as_bytes()), found);
+    assert_eq!(variables(stream(&square).as_bytes()), read::VariableRead::default());
 }
 
 #[test]
@@ -1693,6 +2454,34 @@ fn previewless_placement_placeholder_inherits_lock() {
     assert!(node.visible);
 }
 
+/// A placed file's XML id names the linked image it comes in as, for the variable library's
+/// bindings.
+#[test]
+fn a_placed_files_xml_id_names_its_image() {
+    let preview = [&b"2 1 12 32 17 "[..], &[255, 255, 0, 0, 128, 0, 64, 0, 9, 9, 9, 9]].concat();
+    let name = "%_/ArtDictionary :\r%_/XMLUID : (photo_x5F_1) ; (AI10_ArtUID) ,\r%_;\r";
+    let r = read(&placed(true, "[5 0 0 -5 0 200]", "/pics/photo.png", Some(&preview), name)).unwrap();
+    let a = art(&r.doc);
+    assert!(matches!(a[0].kind, NodeKind::Image(_)), "{:?}", a[0].kind);
+    assert_eq!(r.xml_ids.get("photo_x5F_1"), Some(&Some(a[0].id)));
+}
+
+/// The XML ids kept stay within `MAX_XML_ID_BYTES` in all: an id that would pass it is left out,
+/// and a shorter one after it still fits.
+#[test]
+fn xml_ids_stay_within_their_byte_budget() {
+    use vectorcraft_doc::NodeId;
+    let (mut ids, mut bytes) = (std::collections::HashMap::new(), 0);
+    super::read::remember_xml_id(&mut ids, &mut bytes, "a".repeat(super::read::MAX_XML_ID_BYTES - 4), NodeId(1));
+    super::read::remember_xml_id(&mut ids, &mut bytes, "long_id".into(), NodeId(2));
+    super::read::remember_xml_id(&mut ids, &mut bytes, "id_2".into(), NodeId(3));
+    super::read::remember_xml_id(&mut ids, &mut bytes, "id_2".into(), NodeId(4));
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains_key("long_id"));
+    assert_eq!(ids.get("id_2"), Some(&None), "two objects with one id are neither of them that id's");
+    assert_eq!(bytes, super::read::MAX_XML_ID_BYTES);
+}
+
 #[test]
 fn placed_files_are_linked_images_showing_their_preview() {
     // A 2×1 preview (premultiplied ARGB, a padded row) of a file of 4×2 pixels.
@@ -1779,6 +2568,33 @@ fn text_objects_are_slots_named_after_their_story() {
     let r = read_ok(&layer(&format!("{look}{own}1 (Style) XW\n")));
     let a = art(&r.doc);
     assert_eq!((a.len(), a[0].children().map(Vec::len), slot_of(a[1].name.as_deref())), (2, Some(1), Some(Some(7))));
+    // The type of the look in a group of it is the object's too.
+    let nested = look.replacen("u\n", "u\nu\n", 1).replacen("U\n", "U\nU\n", 1);
+    let r = read_ok(&layer(&format!("{nested}{own}1 (Style) XW\n")));
+    let mut slots = vec![];
+    r.doc.walk(|n| {
+        if let Some(story) = slot_of(n.name.as_deref()) {
+            slots.push(story);
+        }
+    });
+    assert_eq!(slots, [Some(7)]);
+    // Whatever comes of the object's style, the type of its look is the object's.
+    for marker in ["1 () XW", "2 (Style) XW"] {
+        let r = read_ok(&layer(&format!("{look}{own}{marker}\n")));
+        let mut looks = 0;
+        r.doc.walk(|n| looks += usize::from(super::is_look_slot(n.name.as_deref())));
+        assert_eq!(looks, 0, "{marker}");
+    }
+    // In the look of a group, the type is that of a copy the look draws: a slot without a story.
+    let group = "u\n%_/AI11Text :\n%_0 /FreeUndo ,\n%_0 /FrameIndex ,\n%_7 /StoryIndex ,\n%_;\n%_U\n";
+    let r = read_ok(&layer(&format!("{look}{group}1 (Style) XW\n")));
+    let mut slots = vec![];
+    r.doc.walk(|n| {
+        if slot_of(n.name.as_deref()).is_some() {
+            slots.push(n.name.clone());
+        }
+    });
+    assert!(slots.len() == 1 && slots.iter().all(|n| super::is_look_slot(n.as_deref())), "{slots:?}");
 }
 
 /// A file in the legacy format (version 7) whose layer holds `art`, crop marks 0 0 200 100.
@@ -2785,6 +3601,80 @@ fn an_object_with_a_feather_style_comes_in_with_a_live_effect() {
     assert!(!r.warnings.iter().any(|w| w.contains("drawn look")), "{:?}", r.warnings);
 }
 
+/// An art style section with style `PF`: an Effect › Pathfinder filter with `Command` `command`
+/// and `Mix` `mix` in the object's chain, over a fill and stroke that paint nothing.
+fn pathfinder_styles(command: u32, mix: f64) -> String {
+    format!(
+        "%AI9_BeginArtStyles\n/KnownStyle :\n(PF) /Name ,\n/ActiveStyle :\n/CompoundFilter :\n(Chain Style Filter) 0 0 /Filter ,\n1 /Visible ,\n\
+         /BasicFilter :\n(Adobe Pathfinder) 1 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n\
+         0 /Bool (RemovePoints) ,\n{mix} /Real (Mix) ,\n1 /Bool (ConvertCustom) ,\n{command} /Int (Command) ,\n1 /Real (TrapMaxTint) ,\n\
+         1 /Real (TrapAspect) ,\n0.4 /Real (TrapTint) ,\n0.25 /Real (TrapThickness) ,\n0 /Bool (TrapReverse) ,\n10 /Real (Precision) ,\n\
+         (Op) /UnicodeString (DisplayString) ,\n0 /Bool (TrapConvertCustom) ,\n0.05 /Real (TrapTintTolerance) ,\n1 /Bool (ExtractUnpainted) ,\n\
+         ; /Dict ;\n /Part ,\n\
+         /CompoundFilter :\n(Stack Style Filter) 0 0 /Filter ,\n1 /Visible ,\n\
+         /BasicFilter :\n(Stroke Style Filter) 0 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n/StrokeStyle : 0 1 0 0 0 Xy\n0 0 Xd\n/Def ;\n (StrokeStyle) ,\n; /Dict ;\n /Part ,\n\
+         /BasicFilter :\n(Conduit Filter) 0 0 /Filter ,\n1 /Visible ,\n;\n /Part ,\n\
+         /BasicFilter :\n(Fill Style Filter) 0 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n/FillStyle : 0 1 0 0 0 Xy\n0 0 Xd\n/Def ;\n (FillStyle) ,\n; /Dict ;\n /Part ,\n\
+         ;\n /Part ,\n;\n%AI9_EndArtStyles\n"
+    )
+}
+
+/// A group of a red and a blue square with style `PF`: its drawn look (one path of their area),
+/// then the group on `%_` lines.
+fn pathfinder_group() -> String {
+    let hidden = |color: &str, x: f64| format!("{color}{}f\n", rect_path(x, 0.0, x + 10.0, 10.0)).replace('\n', "\n%_");
+    format!(
+        "0 Ae\nu\n{RED}{}f\nU\n%_0 Ae\n%_u\n%_{}{}U\n1 (PF) XW\n",
+        rect_path(0.0, 0.0, 15.0, 10.0),
+        hidden(RED, 0.0),
+        hidden("0 0 1 0 0 0 1 Xa\n", 5.0)
+    )
+}
+
+#[test]
+fn a_group_with_a_pathfinder_effect_keeps_its_members_and_the_effect() {
+    // GUARDS: the style was not read, and the group came in as its drawn look: one path, with no effect.
+    let r = read_ok(&format!("{}{}", pathfinder_styles(0, 0.5), layer(&pathfinder_group())));
+    let a = art(&r.doc);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    let members = a[0].children().cloned().unwrap_or_default();
+    assert_eq!(members.len(), 2, "the squares, not the look: {a:#?}");
+    assert!(members.iter().all(|m| matches!(m.kind, NodeKind::Path { .. })), "{members:#?}");
+    assert_eq!((fill(&members[0]).color(), fill(&members[1]).color()), (Some(Color::rgb(1.0, 0.0, 0.0)), Some(Color::rgb(0.0, 0.0, 1.0))));
+    let effects: Vec<_> = a[0].appearance.effects.iter().map(|e| (e.id.as_str(), e.visible)).collect();
+    assert_eq!(effects, [("pathfinder.add", true)]);
+    assert!(a[0].appearance.items.is_empty(), "{:?}", a[0].appearance);
+    assert!(!r.warnings.iter().any(|w| w.contains("drawn look")), "{:?}", r.warnings);
+}
+
+#[test]
+fn a_pathfinder_style_this_does_not_read_keeps_the_drawn_look() {
+    // Another command (Intersect, Trap), and a Precision other than the one read.
+    let other = pathfinder_styles(0, 0.5).replace("10 /Real (Precision)", "5 /Real (Precision)");
+    for styles in [pathfinder_styles(1, 0.5), pathfinder_styles(12, 0.5), other] {
+        let r = read_ok(&format!("{styles}{}", layer(&pathfinder_group())));
+        let a = art(&r.doc);
+        assert_eq!(a.len(), 1, "{a:#?}");
+        let look = a[0].children().cloned().unwrap_or_default();
+        assert_eq!(look.len(), 1, "the look's one path: {a:#?}");
+        assert!(a[0].appearance.effects.is_empty(), "{:?}", a[0].appearance);
+    }
+}
+
+#[test]
+fn a_path_with_a_pathfinder_effect_keeps_its_drawn_look() {
+    // Effect › Pathfinder doesn't apply to a lone path: its style stays the drawn look's.
+    let hidden_rect = rect_path(0.0, 0.0, 10.0, 10.0).replace('\n', "\n%_");
+    let art_ = format!("0 Ae\nu\n{RED}{}f\nU\n%_{hidden_rect}f\n1 (PF) XW\n", rect_path(0.0, 0.0, 10.0, 10.0));
+    let r = read_ok(&format!("{}{}", pathfinder_styles(0, 0.5), layer(&art_)));
+    let a = art(&r.doc);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert!(matches!(a[0].kind, NodeKind::Group { .. }), "the look, not the path: {a:#?}");
+    let mut effects = 0;
+    r.doc.walk(|n| effects += n.appearance.effects.len());
+    assert_eq!(effects, 0);
+}
+
 #[test]
 fn an_object_with_convert_to_shape_comes_in_as_itself_with_the_effect_live() {
     // GUARDS: `Adobe Shape Effects` wasn't read, so the object came in as its drawn look.
@@ -3731,10 +4621,16 @@ fn layer_options_of_nine_to_twelve_operands() {
 }
 
 /// A blend's record as the editing data writes it after `(Adobe Path Blends) 1 0 n XP`: `DCBA`,
-/// version 1, then (as far as the reader reads it) the number of keys at word 10 and a record of
-/// six words per key starting with its id. Hand-written; the other words are zero.
+/// Specified Steps, then (as far as the reader reads it) the number of keys at word 10 and a record
+/// of six words per key starting with its id. Hand-written; the other words are zero.
 fn blend_record(ids: &[char]) -> String {
-    let mut words: Vec<u32> = vec![u32::from_le_bytes(*b"DCBA"), 1, 0, 0, 0, 0, 0, 0, 0, 0, ids.len() as u32];
+    blend_record_spaced(ids, 1, 0.0, 0)
+}
+
+/// [`blend_record`] with the spacing `spacing` at word 1 (0 Smooth Color, 1 Specified Steps, 2
+/// Specified Distance), the distance `distance` at word 2 and `steps` at word 4.
+fn blend_record_spaced(ids: &[char], spacing: u32, distance: f32, steps: u32) -> String {
+    let mut words: Vec<u32> = vec![u32::from_le_bytes(*b"DCBA"), spacing, distance.to_bits(), 0, steps, 0, 0, 0, 0, 0, ids.len() as u32];
     for id in ids {
         words.extend([*id as u32, 0, 0, 0, 0, 0]);
     }
@@ -3760,11 +4656,16 @@ fn blend_part(kind: &str, id: Option<&str>) -> String {
 /// `spine` (path operators, `%_` lines), with its drawn steps (three between the keys) and the
 /// record `record`.
 fn blend_file(spine: &str, ids: [Option<&str>; 2], record: &str) -> String {
-    let (red, blue) = ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+    blend_file_colored(spine, ids, record, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+}
+
+/// [`blend_file`] with the left key in RGB `from`, the right one in `to`, and the steps drawn
+/// between their colors.
+fn blend_file_colored(spine: &str, ids: [Option<&str>; 2], record: &str, from: [f64; 3], to: [f64; 3]) -> String {
     let mut art = String::from("%_0 Ae\n%_u\n");
-    art += &square(0.0, 40.0, 20.0, red, true);
+    art += &square(0.0, 40.0, 20.0, from, true);
     art += &blend_part("K", ids[0]);
-    art += &square(100.0, 40.0, 20.0, blue, true);
+    art += &square(100.0, 40.0, 20.0, to, true);
     art += &blend_part("K", ids[1]);
     art += spine;
     art += "%_N\n";
@@ -3772,7 +4673,8 @@ fn blend_file(spine: &str, ids: [Option<&str>; 2], record: &str) -> String {
     art += "%_U\n%_9 () XW\nu\n";
     for i in 0..5 {
         let t = i as f64 / 4.0;
-        art += &square(t * 100.0, 40.0, 20.0, [1.0 - t, 0.0, t], false);
+        let rgb = [0, 1, 2].map(|c| from[c] + (to[c] - from[c]) * t);
+        art += &square(t * 100.0, 40.0, 20.0, rgb, false);
     }
     art += "U\n9 () XW\n0 Ae\n";
     art += record;
@@ -3807,6 +4709,15 @@ fn a_blend_comes_in_as_a_live_blend() {
     assert!(!s.warnings.iter().any(|w| w == super::blend::DRAWN), "{:?}", s.warnings);
 }
 
+/// The tags after a blend's drawn steps are the live blend's.
+#[test]
+fn a_live_blend_keeps_the_tags_of_its_drawn_steps() {
+    let body = blend_file("%_10 50 m\n%_110 50 L\n", [Some("A"), Some("B")], &blend_record(&['A', 'B']));
+    let (blend, warnings) = read_blend(&body.replace("\nU\n9 () XW\n0 Ae\n", "\nU\n/sku (B-1) XT\n9 () XW\n0 Ae\n"));
+    assert!(matches!(blend.kind, NodeKind::Blend { .. }), "a live blend: {:?} {warnings:?}", blend.kind);
+    assert_eq!(tags(&blend).1, [tag("sku", "B-1")]);
+}
+
 /// A spine written from the right key to the left one keeps the keys in their order on it (the
 /// red key first), sitting on its last and first anchors.
 #[test]
@@ -3815,6 +4726,106 @@ fn a_blends_spine_written_backwards_keeps_its_keys_order() {
     let NodeKind::Blend { children, spec } = &blend.kind else { panic!("a live blend: {:?} {warnings:?}", blend.kind) };
     assert!(matches!(fill(&children[0]), Paint::Solid { color, .. } if color.to_rgb()[0] > 0.9), "the first key is the red one");
     assert_eq!(spec.key_anchors, vec![1, 0], "the red key on the spine's end, the blue one on its start");
+}
+
+/// A blend's spacing comes from its record: Specified Distance with its distance (25 pt from one
+/// step's edge to the corresponding edge of the next lays three out between keys 100 pt apart),
+/// Smooth Color (keys 5/255 apart in blue take three steps), and Specified Steps with the steps
+/// counted from the drawn ones, whatever its record's word 4 holds. The distance counts along the
+/// spine between the keys, also where the spine runs on past the last key.
+#[test]
+fn a_blend_keeps_its_spacing() {
+    use vectorcraft_doc::live::BlendSpacing;
+    let straight = "%_10 50 m\n%_110 50 L\n";
+    let longer = "%_10 50 m\n%_110 50 L\n%_1010 50 L\n";
+    let (red, nearly_red, blue) = ([1.0, 0.0, 0.0], [1.0, 0.0, 5.0 / 255.0], [0.0, 0.0, 1.0]);
+    for (spine, record, (from, to), spacing) in [
+        (straight, blend_record_spaced(&['A', 'B'], 2, 25.0, 3), (red, blue), BlendSpacing::Distance(25.0)),
+        (longer, blend_record_spaced(&['A', 'B'], 2, 25.0, 3), (red, blue), BlendSpacing::Distance(25.0)),
+        (straight, blend_record_spaced(&['A', 'B'], 0, 4.0, 3), (red, nearly_red), BlendSpacing::SmoothColor),
+        (straight, blend_record_spaced(&['A', 'B'], 1, 25.0, 3), (red, blue), BlendSpacing::Steps(3)),
+        (straight, blend_record_spaced(&['A', 'B'], 1, 12.5, 7), (red, blue), BlendSpacing::Steps(3)),
+    ] {
+        let (blend, warnings) = read_blend(&blend_file_colored(spine, [Some("A"), Some("B")], &record, from, to));
+        let NodeKind::Blend { children, spec } = &blend.kind else { panic!("a live blend for {spacing:?}: {:?} {warnings:?}", blend.kind) };
+        assert_eq!(spec.spacing, spacing);
+        assert_eq!(vectorcraft_doc::blend::blend_expand(children, spec).len(), 5, "{spacing:?}");
+        assert!(!warnings.iter().any(|w| w == super::blend::DRAWN), "{spacing:?}: {warnings:?}");
+    }
+}
+
+/// A blend whose spacing doesn't lay out its drawn steps keeps them: a distance that lays out
+/// nine, and Smooth Color between red and blue (more steps than the three drawn); and so does a
+/// spacing the reader doesn't know or a distance that isn't a positive number.
+#[test]
+fn a_blend_whose_spacing_doesnt_lay_out_its_steps_keeps_them() {
+    let straight = "%_10 50 m\n%_110 50 L\n";
+    for record in [
+        blend_record_spaced(&['A', 'B'], 2, 10.0, 9),
+        blend_record_spaced(&['A', 'B'], 0, 4.0, 254),
+        blend_record_spaced(&['A', 'B'], 3, 25.0, 3),
+        blend_record_spaced(&['A', 'B'], 2, 0.0, 3),
+        blend_record_spaced(&['A', 'B'], 2, f32::NAN, 3),
+        blend_record_spaced(&['A', 'B'], 2, 1e-30, 3),
+    ] {
+        let (blend, warnings) = read_blend(&blend_file(straight, [Some("A"), Some("B")], &record));
+        assert!(!matches!(blend.kind, NodeKind::Blend { .. }), "{record}: {:?}", blend.kind);
+        assert_eq!(blend.children().map(|c| c.len()), Some(5), "the five drawn squares");
+        assert!(warnings.iter().any(|w| w == super::blend::DRAWN), "{warnings:?}");
+    }
+}
+
+/// Three keys with Specified Distance, unevenly spaced on a straight spine (red at x 0, blue at
+/// 100, green at 150, 20 pt squares): 25 pt lays three steps out between the first two keys and
+/// one between the last two, and a blend drawn that way comes in live. The same seven objects
+/// drawn two and two between the keys keep their drawn steps.
+#[test]
+fn a_blend_of_three_keys_keeps_its_distance_between_each_pair() {
+    use vectorcraft_doc::live::BlendSpacing;
+    let (red, blue, green) = ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+    let mix = |a: [f64; 3], b: [f64; 3], t: f64| [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * t);
+    let file = |drawn: &[(f64, [f64; 3])]| {
+        let mut art = String::from("%_0 Ae\n%_u\n");
+        for (x, rgb, id) in [(0.0, red, "A"), (100.0, blue, "B"), (150.0, green, "C")] {
+            art += &square(x, 40.0, 20.0, rgb, true);
+            art += &blend_part("K", Some(id));
+        }
+        art += "%_10 50 m\n%_110 50 L\n%_160 50 L\n%_N\n";
+        art += &blend_part("S", None);
+        art += "%_U\n%_9 () XW\nu\n";
+        for &(x, rgb) in drawn {
+            art += &square(x, 40.0, 20.0, rgb, false);
+        }
+        art += "U\n9 () XW\n0 Ae\n";
+        art += &blend_record_spaced(&['A', 'B', 'C'], 2, 25.0, 0);
+        art
+    };
+    let three_and_one = [
+        (0.0, red),
+        (25.0, mix(red, blue, 0.25)),
+        (50.0, mix(red, blue, 0.5)),
+        (75.0, mix(red, blue, 0.75)),
+        (100.0, blue),
+        (125.0, mix(blue, green, 0.5)),
+        (150.0, green),
+    ];
+    let (blend, warnings) = read_blend(&file(&three_and_one));
+    let NodeKind::Blend { children, spec } = &blend.kind else { panic!("a live blend: {:?} {warnings:?}", blend.kind) };
+    assert_eq!(spec.spacing, BlendSpacing::Distance(25.0));
+    assert_eq!(vectorcraft_doc::blend::blend_steps(children, spec), vec![3, 1]);
+    let two_and_two = [
+        (0.0, red),
+        (100.0 / 3.0, mix(red, blue, 1.0 / 3.0)),
+        (200.0 / 3.0, mix(red, blue, 2.0 / 3.0)),
+        (100.0, blue),
+        (350.0 / 3.0, mix(blue, green, 1.0 / 3.0)),
+        (400.0 / 3.0, mix(blue, green, 2.0 / 3.0)),
+        (150.0, green),
+    ];
+    let (blend, warnings) = read_blend(&file(&two_and_two));
+    assert!(!matches!(blend.kind, NodeKind::Blend { .. }), "{:?}", blend.kind);
+    assert_eq!(blend.children().map(|c| c.len()), Some(7), "the seven drawn squares");
+    assert!(warnings.iter().any(|w| w == super::blend::DRAWN), "{warnings:?}");
 }
 
 /// A curved spine (a line, a curve and a line) is read with its points exactly; a blend whose drawn
@@ -4273,6 +5284,200 @@ fn an_objects_on_path_group_in_versioned_content_opens_once() {
     assert_eq!(kids.len(), 1);
     assert_eq!(kids[0].children().unwrap().len(), 5);
     assert!(kids[0].extras().objects_on_path.is_some());
+}
+
+// ---- brushes ------------------------------------------------------------------------------
+
+const CALLIGRAPHIC: &str = "Adobe Calligraphic Brush Tool";
+const SCATTER: &str = "Adobe Scatter Brush Tool";
+const ART_BRUSH: &str = "Adobe ArtOnPath Brush Tool";
+const PATTERN_BRUSH: &str = "Adobe PatternOnPath Brush Tool";
+const BRISTLE: &str = "Adobe dBrush Brush Tool";
+
+/// A plug-in object of plug-in `kind` named `name`, its parameters `params` split into strings of
+/// 16 characters at most (`-` after each but the last, `.` after that).
+fn plugin_object(kind: &str, name: &str, params: &str) -> String {
+    let chars: Vec<char> = params.chars().collect();
+    let chunks: Vec<String> = chars.chunks(16).map(|c| c.iter().collect()).collect();
+    let n = chunks.len();
+    let lines: String = chunks.iter().enumerate().map(|(i, c)| format!("({c}) {}\n", if i + 1 == n { "." } else { "-" })).collect();
+    format!("%AI5_Begin_NonPrinting\nNp\n%AI8_BeginPluginObject\n({kind})\n({name})\n{lines}%AI8_EndPluginObject\n%AI5_End_NonPrinting--\n")
+}
+
+/// The brush manager's order of the brushes `brushes` (plug-in, name).
+fn brush_order(brushes: &[(&str, &str)]) -> String {
+    let params: String = brushes.iter().map(|(k, n)| format!(" {k}/ {n}/")).collect();
+    plugin_object(brush::MANAGER, brush::MANAGER, &params)
+}
+
+/// A brush's art named `name`: a filled square of side `side`.
+fn brush_art(name: &str, side: f64) -> String {
+    format!("%AI8_BeginBrushPattern\n({name})\n0 A\n0 g\n{}f\n%AI8_EndBrushPattern\n", rect_path(0.0, 0.0, side, side))
+}
+
+/// A Calligraphic brush with diameter 2 to 6, roundness 40 to 60 and angle -30 to 10, the diameter
+/// varying at random, the roundness fixed and the angle with the pen's pressure.
+const NIB: &str = "1 2 6 40 60 -30 10 1 0 2 0";
+/// A Scatter brush of the art `Dot art`: size 50% to 150% at random, spacing 120% to 200% fixed,
+/// scatter -25% to 25% with the pressure, rotation -45° to 30° at random and following the path.
+const SPRAY: &str = "2 /Dot art/ 5 1 0 0 / 0 0.5 1.5 1 1.2 2 0 -0.25 0.25 2 -45 30 1 1 0";
+/// An Art brush of the art `Ribbon art`.
+const RIBBON: &str = "2 / Ribbon art/ / / / / 0 0/ 5 0 0 0 /  1 1 1 0 1 0 0 0 1 1 0 0 0 0 1";
+/// A Pattern brush of four tiles (the fourth slot empty) at 80%.
+const FENCE: &str = "2 / Tile one/ Tile two/ Tile three/ / Tile five/ 0 0/ 0 1 /  1 1 0.8 0 4 0 0 0 0.8 0.8 0 0 0 0 0";
+/// A Bristle brush: stiffness 60%, thickness 40%, density 30%, opacity 80%, length 150%, size 2 mm.
+const MOP: &str = "0 4 0.6 0.4 0.3 0.8 1.5 2 library shape";
+
+/// The brushes of the five kinds, their art and the manager's order (the Bristle brush first).
+fn five_brushes() -> String {
+    let order = brush_order(&[(BRISTLE, "Mop"), (CALLIGRAPHIC, "Nib"), (SCATTER, "Spray"), (ART_BRUSH, "Ribbon"), (PATTERN_BRUSH, "Fence")]);
+    let art: String = ["Dot art", "Ribbon art", "Tile one", "Tile two", "Tile three", "Tile five"].iter().map(|n| brush_art(n, 4.0)).collect();
+    let objects = [
+        (CALLIGRAPHIC, "Nib", NIB),
+        (SCATTER, "Spray", SPRAY),
+        (ART_BRUSH, "Ribbon", RIBBON),
+        (PATTERN_BRUSH, "Fence", FENCE),
+        (BRISTLE, "Mop", MOP),
+    ];
+    let objects: String = objects.iter().map(|(k, n, p)| plugin_object(k, n, p)).collect();
+    format!("{art}{order}{objects}")
+}
+
+fn brush_named<'a>(lib: &'a [vectorcraft_brush::Brush], name: &str) -> &'a vectorcraft_brush::BrushKind {
+    match lib.iter().find(|b| b.name == name) {
+        Some(b) => &b.kind,
+        None => panic!("no brush {name} in {:?}", lib.iter().map(|b| &b.name).collect::<Vec<_>>()),
+    }
+}
+
+/// The brush manager's order gives the kind and name of each brush, in the panel's order.
+#[test]
+fn the_brush_managers_order_gives_each_brushs_kind_in_order() {
+    let params = format!(" {BRISTLE}/ Mop/ {CALLIGRAPHIC}/ Nib/ {SCATTER}/ Spray/ {ART_BRUSH}/ Ribbon/ {PATTERN_BRUSH}/ Fence  /");
+    let order = brush::parse_brush_manager(&params).unwrap();
+    use brush::Tool;
+    let want = [(Tool::Bristle, "Mop"), (Tool::Calligraphic, "Nib"), (Tool::Scatter, "Spray"), (Tool::Art, "Ribbon"), (Tool::Pattern, "Fence  ")];
+    assert_eq!(order, want.map(|(t, n)| (t, n.to_string())), "a name keeps its trailing spaces");
+    assert_eq!(brush::parse_brush_manager(" Some Other Plugin/ Thing/"), None);
+}
+
+/// A file's brushes replace the default ones, in the manager's order, with their values. A pattern
+/// brush is left out (which slot holds which tile isn't known), with a note.
+#[test]
+fn a_files_brushes_come_in_with_their_values_in_the_panels_order() {
+    let r = read_ok(&format!("{}{}", five_brushes(), layer(&(rect_path(0.0, 0.0, 10.0, 10.0) + "f\n"))));
+    let lib = vectorcraft_brush::library(&r.doc);
+    let names: Vec<&str> = lib.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["Mop", "Nib", "Spray", "Ribbon"], "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w == "brushes VectorCraft can't read yet were left out of the Brushes panel (1)"), "{:?}", r.warnings);
+    use vectorcraft_brush::{BrushKind, Variation};
+    let BrushKind::Calligraphic(c) = brush_named(&lib, "Nib") else { panic!("calligraphic") };
+    assert_eq!((c.angle, c.roundness, c.size), (-10.0, 50.0, 4.0));
+    assert_eq!(c.variation, [20.0, 10.0, 2.0]);
+    assert_eq!(c.modes, Some([Variation::Pressure, Variation::Fixed, Variation::Random]));
+    let BrushKind::Scatter(s) = brush_named(&lib, "Spray") else { panic!("scatter") };
+    assert_eq!((s.size, s.spacing, s.scatter, s.rotation), ((50.0, 150.0), (120.0, 200.0), (-25.0, 25.0), (-45.0, 30.0)));
+    assert_eq!(s.modes, Some([Variation::Random, Variation::Fixed, Variation::Pressure, Variation::Random]));
+    assert!(s.rotation_relative_to_path);
+    assert_eq!(s.art.geometric_bounds().map(|b| (b.width(), b.height())), Some((4.0, 4.0)), "the art of its section");
+    let BrushKind::Art(a) = brush_named(&lib, "Ribbon") else { panic!("art") };
+    assert!(a.art.geometric_bounds().is_some(), "the art of its section");
+    assert_eq!(a.colorization, vectorcraft_brush::Colorization::None, "the art keeps its colors");
+    let BrushKind::Bristle(b) = brush_named(&lib, "Mop") else { panic!("bristle") };
+    let got = [b.stiffness, b.thickness, b.density, b.opacity, b.length, b.size];
+    let want = [60.0, 40.0, 30.0, 80.0, 150.0, 2.0 * 72.0 / 25.4];
+    assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-9), "{got:?}");
+}
+
+/// A Pattern brush's five slots name its art sections, in its order, an empty slot naming none;
+/// its scale comes in as a percentage.
+#[test]
+fn a_pattern_brushs_five_slots_are_kept() {
+    let d = brush::parse_tool_object(brush::Tool::Pattern, "Fence", FENCE).unwrap();
+    let brush::DraftKind::Pattern { tiles, scale } = d.kind else { panic!("{d:?}") };
+    let s = |n: &str| Some(n.to_string());
+    assert_eq!(tiles, [s("Tile one"), s("Tile two"), s("Tile three"), None, s("Tile five")]);
+    assert!((scale - 80.0).abs() < 1e-9);
+    let d = brush::parse_tool_object(brush::Tool::Scatter, "Spray", SPRAY).unwrap();
+    assert!(matches!(d.kind, brush::DraftKind::Scatter { ref art, .. } if art == "Dot art"), "{d:?}");
+    let d = brush::parse_tool_object(brush::Tool::Art, "Ribbon", RIBBON).unwrap();
+    assert!(matches!(d.kind, brush::DraftKind::Art { ref art, .. } if art == "Ribbon art"), "{d:?}");
+}
+
+/// A brush's art filled with a pattern the file defines before it is read, with that pattern.
+#[test]
+fn a_brushs_art_takes_the_patterns_defined_before_it() {
+    let dots = "%AI3_BeginPattern: (Dots)\n(Dots) 0 0 4 4\n%_0 0 0 1 k\n%_1 1 m\n%_3 1 L\n%_3 3 L\n%_1 3 L\n%_f\nE\n%AI3_EndPattern\n";
+    let art_ = format!(
+        "%AI8_BeginBrushPattern\n(Dot art)\n0 A\n(Dots) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n%AI8_EndBrushPattern\n",
+        rect_path(0.0, 0.0, 4.0, 4.0)
+    );
+    let r = read_ok(&format!("{dots}{art_}{}{}", plugin_object(SCATTER, "Spray", SPRAY), layer("")));
+    let lib = vectorcraft_brush::library(&r.doc);
+    let vectorcraft_brush::BrushKind::Scatter(s) = brush_named(&lib, "Spray") else { panic!("scatter") };
+    assert!(matches!(fill(&s.art), Paint::Pattern { ref pattern, .. } if pattern == "Dots"), "{:?}", r.warnings);
+}
+
+/// A file without brush objects keeps the default brushes.
+#[test]
+fn a_file_without_brushes_keeps_the_default_ones() {
+    let r = read_ok(&layer(&(rect_path(0.0, 0.0, 10.0, 10.0) + "f\n")));
+    assert!(!r.doc.unknown.contains_key(vectorcraft_brush::DOC_KEY));
+}
+
+/// A brush whose object can't be read, or whose art is missing or can't be read, is left out with a
+/// note; the layers and the other brushes still come in.
+#[test]
+fn a_brush_that_cant_be_read_leaves_the_layers_and_other_brushes() {
+    let bad_art = "%AI8_BeginBrushPattern\n(Odd art)\n0 g\n0 0 m\n1 1 L\nnotanoperator\nf\n%AI8_EndBrushPattern\n";
+    let objects = [
+        plugin_object(CALLIGRAPHIC, "Nib", NIB),
+        plugin_object(CALLIGRAPHIC, "Short", "1 2 3"),
+        plugin_object(CALLIGRAPHIC, "Huge", "1 2 inf 40 60 -30 10 1 0 2 0"),
+        plugin_object(SCATTER, "Odd", &SPRAY.replace("Dot art", "Odd art")),
+        plugin_object(SCATTER, "Lost", &SPRAY.replace("Dot art", "Nowhere")),
+        plugin_object(ART_BRUSH, "Bare", "2 / / / / / / 0 0/ 5 0 0 0 /  1 1 1 0 1 0 0 0 1 1 0 0 0 0 1"),
+        plugin_object(BRISTLE, "Nib", MOP),
+    ]
+    .concat();
+    let r = read_ok(&format!("{bad_art}{objects}{}", layer(&(rect_path(0.0, 0.0, 10.0, 10.0) + "f\n"))));
+    assert_eq!(art(&r.doc).len(), 1, "the layer's art");
+    let lib = vectorcraft_brush::library(&r.doc);
+    assert_eq!(lib.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Nib"], "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.ends_with("Brushes panel (6)")), "{:?}", r.warnings);
+}
+
+/// Files with brush objects and no brushes VectorCraft reads get an empty list, not the defaults.
+#[test]
+fn a_file_whose_brushes_are_all_left_out_has_none() {
+    let r = read_ok(&format!("{}{}", plugin_object(PATTERN_BRUSH, "Fence", FENCE), layer("")));
+    assert!(vectorcraft_brush::library(&r.doc).is_empty());
+}
+
+/// A brush object that ends after its plug-in name is counted as a brush left out, and the file
+/// gets no default brushes.
+#[test]
+fn a_brush_object_without_a_name_is_counted_as_left_out() {
+    let nameless = format!("%AI5_Begin_NonPrinting\nNp\n%AI8_BeginPluginObject\n({CALLIGRAPHIC})\n%AI8_EndPluginObject\n%AI5_End_NonPrinting--\n");
+    let r = read_ok(&format!("{nameless}{}", layer("")));
+    assert!(vectorcraft_brush::library(&r.doc).is_empty(), "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.ends_with("Brushes panel (1)")), "{:?}", r.warnings);
+    let r = read_ok(&format!("{}{nameless}{}", plugin_object(CALLIGRAPHIC, "Nib", NIB), layer("")));
+    let lib = vectorcraft_brush::library(&r.doc);
+    assert_eq!(lib.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Nib"], "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.ends_with("Brushes panel (1)")), "{:?}", r.warnings);
+}
+
+/// A gradient's `Br` (a stop's ramp) isn't a brush: the gradient keeps its stops.
+#[test]
+fn a_gradients_br_is_not_a_brush() {
+    let gradient =
+        "%AI5_BeginGradient: (G)\n(G) 0 2 Bd\n[\n0 0 0 0 1 1 1 2 1 6 50 0 Bs\n0 0 0 1 0 0 0 2 0.5 6 50 100 Bs\n0 Br\nBD\n%AI5_EndGradient\n";
+    let art_ = format!("{}Bb\n1 (G) 0 0 0 1 1 0 0 1 0 0 1 Bg\n10 0 0 10 100 50 Xm\nf\n0 BB\n", rect_path(0.0, 0.0, 20.0, 20.0));
+    let r = read_ok(&format!("{gradient}{}", layer(&art_)));
+    assert!(!r.doc.unknown.contains_key(vectorcraft_brush::DOC_KEY));
+    let Paint::Gradient(g) = fill(&art(&r.doc)[0]) else { panic!("a gradient: {:?}", r.warnings) };
+    assert_eq!(g.gradient.stops.len(), 2);
 }
 
 use read::{GRAPH_PLAIN, GRAPH_UNENDED};

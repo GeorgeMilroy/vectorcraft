@@ -44,6 +44,7 @@ pub mod pngtext;
 pub mod ppi;
 pub mod progress;
 pub mod psdread;
+mod pxrread;
 mod save;
 mod screens;
 mod svg;
@@ -107,7 +108,7 @@ mod export_names;
 mod formats;
 
 #[cfg(not(target_arch = "wasm32"))]
-use access::list_dir;
+pub(crate) use access::list_dir;
 pub use access::write_file_with;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use access::{Placed, copy_new, file_metadata};
@@ -119,7 +120,7 @@ pub(crate) use access::{drive_share_of, share_of};
 #[cfg(test)]
 pub(crate) use access::{drive_share_path, share_path, touched};
 #[cfg(not(target_arch = "wasm32"))]
-use access::{may_read, may_write};
+pub(crate) use access::{may_read, may_write};
 pub use commands::specs;
 pub use export_names::artboard_file_names;
 pub(crate) use export_names::{default_name, merge, unique_file_names, with_black_output, write_or_return};
@@ -205,6 +206,8 @@ mod tests_psdread;
 mod tests_jp2read;
 #[cfg(test)]
 mod tests_pcxread;
+#[cfg(test)]
+mod tests_pxrread;
 
 #[cfg(test)]
 mod tests_epsimport;

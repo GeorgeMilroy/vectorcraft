@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use kurbo::Point;
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::clipnest::MAX_NEST;
 use vectorcraft_doc::{LayerColor, LineCap, Node, NodeKind};
@@ -121,6 +122,31 @@ fn a_postscript_ai_that_names_its_prolog_without_including_it_opens_with_its_lay
     let stroke = square.appearance.stroke().unwrap();
     assert_eq!((stroke.width, stroke.cap), (0.8, LineCap::Round));
     assert_eq!(tree(d.layers[1].children().unwrap()), "p");
+}
+
+/// A `.ai` in PostScript form with a pattern defined in the version 7 form (§3.4): the layer keeps
+/// its name, and the pattern is a swatch that fills the path from its offset.
+#[test]
+fn a_postscript_ai_with_a_version_7_pattern_fills_with_it() {
+    let pattern = "%AI3_BeginPattern: (Stripes)\n(Stripes) 0 0 10 10 [\n%AI3_Tile\n(0 O 0 R 0 0 0 0.5 k) @ _ &\n\
+                   (0 O 0 R 0 0 0 1 K) @ (\r1 w\r0 5 m\r10 5 L\rS\r) &\n] E\n%AI3_EndPattern\n";
+    let setup = "Adobe_IllustratorA_AI3 /initialize get exec\n";
+    let style = "0 i 1 J 1 j 0.8 w 4 M []0 d\n0 D\n";
+    let src = NAMED_PROLOG
+        .replace(setup, &format!("{setup}{pattern}"))
+        .replace(style, &format!("{style}(Stripes) 5 5 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n"))
+        .replace("10 10 L\nS\n", "10 10 L\nB\n");
+    let r = import(src.as_bytes()).unwrap();
+    assert!(r.warnings.is_empty() && !r.preview, "{:?}", r.warnings);
+    let d = &r.document;
+    assert_eq!(d.layers[0].name.as_deref(), Some("SECTION::Cut"));
+    assert!(matches!(&d.swatch("Stripes").unwrap().paint, Paint::Pattern { pattern, .. } if pattern == "Stripes"));
+    assert_eq!(d.pattern("Stripes").unwrap().art.len(), 2);
+    let square = &d.layers[0].children().unwrap()[0];
+    let Some(Paint::Pattern { pattern, xf }) = square.appearance.fill().map(|f| f.paint.clone()) else { panic!("{:?}", square.appearance) };
+    assert_eq!(pattern, "Stripes");
+    // The tile's top left, (0, 10) in its space, is at (5, 15) in art space: 85 down the 100-point page.
+    assert_eq!(xf * Point::ZERO, Point::new(5.0, 85.0));
 }
 
 /// A `.ai` in PostScript form with a graph on each of two layers (version 7 specification §17): its
@@ -405,6 +431,26 @@ fn a_legacy_files_paths_keep_their_notes_and_show_center() {
     let attrs: Vec<_> = kids.iter().map(|n| n.extras().attrs.as_deref().map(|a| (a.note.clone(), a.show_center))).collect();
     assert_eq!(attrs, [Some(("first\nsecond line".into(), Some(true))), None], "{:?}", r.warnings);
     assert!(kids[0].shows_center() && !kids[1].shows_center());
+}
+
+/// A version 8 file's object tags open as each object's URL and data.
+#[test]
+fn a_legacy_files_object_tags_open_as_urls_and_data() {
+    let body = format!(
+        "%AI5_BeginLayer\n1 1 1 1 0 0 0 79 128 255 Lb\n(Tags) Ln\n0 A\n0 0 0 1 k\n{}\n/AdobeURL (https://example.com) XT\n/sku (B-7) XT\n\
+         u\n{}\nU\n/part () XT\nLB\n%AI5_EndLayer--\n",
+        tri(10),
+        tri(40)
+    );
+    let r = import(&ai(AI8, "", &body)).unwrap();
+    let kids = r.document.layers[0].children().unwrap();
+    let attrs: Vec<_> = kids.iter().map(|n| n.extras().attrs.as_deref().map(|a| (a.url.clone(), a.data.clone()))).collect();
+    assert_eq!(
+        attrs,
+        [Some(("https://example.com".into(), vec![("sku".into(), "B-7".into())])), Some((String::new(), vec![("part".into(), String::new())]))],
+        "{:?}",
+        r.warnings
+    );
 }
 
 #[test]

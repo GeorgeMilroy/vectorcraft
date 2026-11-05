@@ -26,8 +26,9 @@
 //! - Document settings: Document Raster Effects Settings from the `/Document` dictionary's
 //!   `AI Auto Rasterize`; the author from the header's `%%For`; swatches for the custom colors of
 //!   `%%CMYKCustomColor` and `%%RGBCustomColor` that the document has none of.
-//! - Variables: the variable library, XML nodes of the `/Document` dictionary, isn't read; a note
-//!   gives how many variables and data sets it has ([`VariableLibrary`]).
+//! - Variables: the variable library, XML nodes of the `/Document` dictionary: its variables, data
+//!   sets, active data set and lock, without bindings; a note gives how many entries were left out
+//!   ([`VariableRead`]).
 //! - Objects on Path: a group whose objects' dictionaries carry ids, and a record of the
 //!   `/Document` dictionary naming them, read by [`on_path`].
 //! - Images: `%AI5_BeginRaster`, the colour space `XN`, `[matrix] bounds w h bits type alpha …`
@@ -51,9 +52,15 @@
 //!   lines and `1 (style) XW`: the drawn look is kept, named after the object.
 //! - Patterns: `%AI3_BeginPattern: (name)`, `(name) llx lly urx ury` (the tile, in the pattern's
 //!   space, y up), the tile's art (on `%_` lines in newer files), `E`, `%AI3_EndPattern`; each is
-//!   read by a reader of its own and becomes a pattern swatch. A fill or stroke with one:
+//!   read by a reader of its own and becomes a pattern swatch. An unpainted path whose dictionary
+//!   marks it as the tile's box (`AIPattern_Editor_Backing_Tile_Rect`) is left out of the art. In
+//!   the version 7 form (§3.4) a list
+//!   of layers follows the tile, `[ (colors) @ (tile) & … ] E`, each layer's tile read from its
+//!   string with the colors' state (`_ &`: the tile's box filled). A fill or stroke with one:
 //!   `(name) x y scaleX scaleY angle reflect axis shear shearAxis [matrix] p` (`P`), the matrix
-//!   taking the pattern's space to art space (the other operands are what it is made of).
+//!   taking the pattern's space to art space (the other operands are what it is made of). With a
+//!   pattern defined in the version 7 form, the other operands are applied in order (§5.4.1) before
+//!   the initial matrix.
 //!
 //! - Type in the legacy format (version 7 specification §15): `type To` … `TO`, read by
 //!   [`legacy_text`].
@@ -65,6 +72,9 @@
 //! - Swatches: the palette (`%AI5_BeginPalette`), read by [`super::palette`], replaces the
 //!   default swatches.
 //!
+//! - Brushes: the brush plug-in objects and their art sections (`%AI8_BeginBrushPattern`), read by
+//!   [`super::brush`], replace the default brushes when the file has any.
+//!
 //! - Graphic styles: the style list (`%AI9_BeginArtStyleList`), one `(name)` per style in the
 //!   panel's order, each the name of an art style. The listed styles whose appearance reads
 //!   ([`appearance_from_art_style`](ops::appearance_from_art_style)) replace the default graphic
@@ -72,7 +82,7 @@
 //!   style's appearance and transparency is linked to it. A `1` naming a style the list doesn't
 //!   have is the object's own appearance, not a link.
 //!
-//! Sections the reader doesn't need (brushes, symbols, styles, filters) are skipped;
+//! Sections the reader doesn't need (symbols, styles, filters) are skipped;
 //! type, symbols, fills with a pattern it can't read, placed files without a preview and operators
 //! it doesn't know are errors. So is data that ends inside a layer, a group or a compound path.
 
@@ -109,7 +119,7 @@ mod types;
 
 pub(crate) use art::join_and;
 use art::preview_png;
-pub use document::{PaletteSwatches, VariableLibrary, artboards, palette, variables};
+pub use document::{BindingRef, Brushes, PaletteSwatches, VariableRead, artboards, bindings_note, brushes, palette, variables};
 pub(crate) use document::{slot_frame, slot_of};
 pub use types::IMAGE_TOO_LARGE;
 use types::{BLEND_BUDGET, FLIP, Frame, GState, Graph, Kind, PatternHead, PendingEnvelope, Place, Raster};
@@ -154,7 +164,37 @@ pub struct Structure {
     pub envelopes_drawn: Vec<(NodeId, Node)>,
     /// The document's graphic styles are those of the file's style list, in place of the defaults.
     pub styles_read: bool,
+    /// The file's `%AI24_LargeCanvasScale` (1 when it declares none), applied or not.
+    pub canvas_scale: f64,
+    /// The objects by their XML id (`AI10_ArtUID`), a text object by its slot's id: `None` for an
+    /// id two objects have.
+    pub xml_ids: HashMap<String, Option<NodeId>>,
+    /// The objects the variable library binds to its variables, by their XML ids: the importer
+    /// binds those it keeps.
+    pub bindings: Vec<BindingRef>,
+    /// How many objects the library binds that aren't in `bindings` ([`VariableRead::bindings_skipped`]).
+    pub bindings_skipped: usize,
     pub warnings: Vec<String>,
+}
+
+/// The most XML ids of objects ([`Structure::xml_ids`]) kept.
+const MAX_XML_IDS: usize = 1_000_000;
+
+/// The most bytes of XML ids ([`Structure::xml_ids`]) kept, all ids together.
+pub(super) const MAX_XML_ID_BYTES: usize = 16 << 20;
+
+/// Record that the object `id` has the XML id `uid` in `xml_ids`, whose ids take `bytes` bytes. Two
+/// objects with one id are neither of them that id's. A new id is left out when `xml_ids` holds
+/// [`MAX_XML_IDS`] ids or its bytes would pass [`MAX_XML_ID_BYTES`].
+pub(super) fn remember_xml_id(xml_ids: &mut HashMap<String, Option<NodeId>>, bytes: &mut usize, uid: String, id: NodeId) {
+    if let Some(seen) = xml_ids.get_mut(&uid) {
+        if *seen != Some(id) {
+            *seen = None;
+        }
+    } else if xml_ids.len() < MAX_XML_IDS && bytes.saturating_add(uid.len()) <= MAX_XML_ID_BYTES {
+        *bytes += uid.len();
+        xml_ids.insert(uid, Some(id));
+    }
 }
 
 /// Read the structure of the editing data `data`, applying the file's `%AI24_LargeCanvasScale` only
@@ -204,8 +244,8 @@ struct Reader<'a> {
     custom_more: Option<bool>,
     /// The header ended (`%%EndComments`).
     header_done: bool,
-    /// The variables and data sets of the `/Document` dictionary's variable library.
-    variables: VariableLibrary,
+    /// The `/Document` dictionary's variable library.
+    variables: VariableRead,
     /// The Objects on Path records of the `/Document` dictionary and the ids of the objects.
     on_path: on_path::OnPath,
     gradients: HashMap<String, Gradient>,
@@ -272,10 +312,13 @@ struct Reader<'a> {
     /// dictionary (its name, its opacity mask and the mask's art).
     mesh_ended: bool,
     /// A layer's own state (`Xy` after its art, before `LB`), until something says the art moves on.
-    layer_state: Option<(f32, BlendMode, bool, Knockout)>,
+    layer_state: Option<(f32, BlendMode, bool, Knockout, bool)>,
     /// The state a mesh or blend had before an `Xy` right after its end, which is the layer's
     /// instead when the layer's `LB` follows rather than their own `6 () XW`.
     mesh_undo: Option<(f32, BlendMode, bool, Knockout)>,
+    /// The state a layer's last group or compound path had before an `Xy` right after its end,
+    /// which is the layer's instead when the layer's own `7 () XW` follows.
+    container_undo: Option<(f32, BlendMode, bool, Knockout, bool)>,
     /// Painted copies of clipping paths that have a fill (drawn under what they clip).
     clip_fills: HashSet<NodeId>,
     /// Groups closed as an object's drawn look (`9 () XW`).
@@ -313,6 +356,10 @@ struct Reader<'a> {
     obj_hidden: bool,
     /// The names of text objects, by their slot's id.
     slot_names: HashMap<NodeId, String>,
+    /// [`Structure::xml_ids`].
+    xml_ids: HashMap<String, Option<NodeId>>,
+    /// The bytes of the ids in `xml_ids`.
+    xml_id_bytes: usize,
     /// The artboard's size and centre in files without artboards or crop marks.
     art_size: Option<(f64, f64)>,
     template_center: Option<(f64, f64)>,
@@ -320,15 +367,32 @@ struct Reader<'a> {
     /// (see [`Reader::ensure_space`]); 1 (no scaling) when the file doesn't declare one, `None`
     /// when the declared factor is not applied ([`read`]).
     large_canvas: Option<f64>,
+    /// The declared `%AI24_LargeCanvasScale` (1 without one), applied or not.
+    canvas_scale: f64,
     /// `%AI5_RulerUnits` from the header (Illustrator 7 spec table 3, plus centimeters and pixels).
     ruler_units: Option<u8>,
     /// This reader reads a pattern's definition (see [`Reader::define_pattern`]).
     pattern: Option<PatternHead>,
     /// The tile (y down) of each pattern read, by name.
     pattern_tiles: HashMap<String, Rect>,
+    /// The patterns read from a definition in the version 7 form, whose fills apply their other
+    /// operands before the matrix (see [`Reader::pattern_paint`]).
+    v7_patterns: HashSet<String>,
     /// The legacy text object being read (`To` … `TO`), and the modal type attributes.
     text: Option<legacy_text::LegacyText>,
     type_state: legacy_text::TypeState,
+    /// The file has brush objects (the brush manager's order or a brush).
+    brush_objects: bool,
+    /// The brush manager's order.
+    brush_order: Option<Vec<(super::brush::Tool, String)>>,
+    /// The brushes read, in the order of their objects.
+    brush_drafts: Vec<super::brush::BrushDraft>,
+    /// The art of the brushes (`%AI8_BeginBrushPattern`), by name.
+    brush_art: HashMap<String, Node>,
+    /// The brush art sections read so far, repeated names included.
+    brush_art_sections: usize,
+    /// Brush objects that weren't read.
+    brushes_unread: usize,
     /// The graph being read (see [`Reader::graph_record`]).
     graph: Option<Graph>,
     /// The multi-layer mask being read (`Mb` … `MB`), which goes on past a layer's end.
@@ -340,6 +404,11 @@ struct Reader<'a> {
 fn marker(c: &str) -> &str {
     let word = c.split(|ch: char| ch == ':' || ch.is_whitespace()).next().unwrap_or(c);
     word.strip_prefix("AI").map(|r| r.trim_start_matches(|ch: char| ch.is_ascii_digit())).and_then(|r| r.strip_prefix('_')).unwrap_or(word)
+}
+
+/// Is `name` that of a text slot for type that a look draws ([`document::LOOK_SLOT`])?
+pub(crate) fn is_look_slot(name: Option<&str>) -> bool {
+    name == Some(document::LOOK_SLOT)
 }
 
 impl<'a> Reader<'a> {
@@ -364,7 +433,7 @@ impl<'a> Reader<'a> {
             custom_colors: Vec::new(),
             custom_more: None,
             header_done: false,
-            variables: VariableLibrary::default(),
+            variables: VariableRead::default(),
             on_path: on_path::OnPath::default(),
             gradients: HashMap::new(),
             gradient_def: None,
@@ -412,6 +481,7 @@ impl<'a> Reader<'a> {
             mesh_ended: false,
             layer_state: None,
             mesh_undo: None,
+            container_undo: None,
             styles: HashMap::new(),
             style_list: vec![],
             style_links: vec![],
@@ -424,14 +494,24 @@ impl<'a> Reader<'a> {
             done: false,
             obj_hidden: false,
             slot_names: HashMap::new(),
+            xml_ids: HashMap::new(),
+            xml_id_bytes: 0,
             art_size: None,
             template_center: None,
             large_canvas: None,
+            canvas_scale: 1.0,
             ruler_units: None,
             pattern: None,
             pattern_tiles: HashMap::new(),
+            v7_patterns: HashSet::new(),
             text: None,
             type_state: legacy_text::TypeState::default(),
+            brush_objects: false,
+            brush_order: None,
+            brush_drafts: Vec::new(),
+            brush_art: HashMap::new(),
+            brush_art_sections: 0,
+            brushes_unread: 0,
             graph: None,
             multi_mask: None,
         }
